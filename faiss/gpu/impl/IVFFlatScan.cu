@@ -305,7 +305,8 @@ void runIVFFlatScanTile(
             metricToSortDirection(metricType),
             heapDistances,
             heapIndices,
-            stream);
+            stream,
+            false);
 
     // k-select final output
     auto flatHeapDistances = heapDistances.downcastInner<2>();

@@ -201,6 +201,7 @@ inline __device__ void loadPrecomputedTerm(
 }
 
 template <int NumSubQuantizers, typename LookupT, typename LookupVecT>
+__launch_bounds__(1024)
 __global__ void pqScanPrecomputedMultiPass(
         Tensor<float, 2, true> queries,
         Tensor<float, 2, true> precompTerm1,
@@ -337,7 +338,7 @@ void runMultiPassTile(
 
     // The vector interleaved layout implementation
     if (interleavedCodeLayout) {
-        auto kThreadsPerBlock = 256;
+        auto kThreadsPerBlock = 1024;
 
         auto grid = dim3(ivfListIds.getSize(1), ivfListIds.getSize(0));
         auto block = dim3(kThreadsPerBlock);
@@ -403,7 +404,7 @@ void runMultiPassTile(
     } else {
         // Convert all codes to a distance, and write out (distance,
         // index) values for all intermediate results
-        auto kThreadsPerBlock = 256;
+        auto kThreadsPerBlock = 512;
 
         auto grid = dim3(ivfListIds.getSize(1), ivfListIds.getSize(0));
         auto block = dim3(kThreadsPerBlock);
@@ -512,7 +513,8 @@ void runMultiPassTile(
             false, // L2 distance chooses smallest
             heapDistances,
             heapIndices,
-            stream);
+            stream,
+            false);
 
     // k-select final output
     auto flatHeapDistances = heapDistances.downcastInner<2>();

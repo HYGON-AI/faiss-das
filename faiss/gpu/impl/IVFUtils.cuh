@@ -72,7 +72,8 @@ void runPass1SelectLists(
         bool chooseLargest,
         Tensor<float, 3, true>& heapDistances,
         Tensor<idx_t, 3, true>& heapIndices,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        bool configkey);
 
 /// Performs a final pass of k-selection on the results, producing the
 /// final indices

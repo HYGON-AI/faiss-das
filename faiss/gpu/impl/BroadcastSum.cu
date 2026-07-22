@@ -198,6 +198,7 @@ __global__ void assignAlongColumns(
 }
 
 template <typename T, bool ZeroClamp>
+__launch_bounds__(1024)
 __global__ void sumAlongRows(
         Tensor<T, 1, true> input,
         Tensor<T, 2, true> output) {

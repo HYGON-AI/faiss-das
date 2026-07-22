@@ -25,7 +25,7 @@ namespace gpu {
 // A basic implementation that works for the interleaved by vector layout for
 // any number of sub-quantizers
 template <typename EncodeT, int EncodeBits, typename CodeDistanceT>
-__global__ void pqScanInterleaved(
+__global__ void  __launch_bounds__(1024) pqScanInterleaved(
         Tensor<float, 2, true> queries,
         Tensor<float, 3, true> pqCentroids,
         Tensor<idx_t, 2, true> ivfListIds,
@@ -57,6 +57,17 @@ __global__ void pqScanInterleaved(
     float* distanceOut = distance[outBase].data();
     auto localCodeDistances = codeDistances[queryId][probeId];
 
+    //=========================START
+    int numCodes = codeDistances.getSize(3);
+    int totalElements = numSubQuantizers * numCodes;
+    extern __shared__ float s_localDistances[];
+    for(int i = threadIdx.x; i<totalElements; i+=blockDim.x){
+        int sq = i / numCodes;
+        int code = i % numCodes;
+        s_localDistances[i] = ConvertTo<float>::to(localCodeDistances[sq][code]);
+    }
+    __syncthreads();
+    //=========================END
     // This is where the codes for our list start
     auto vecsBase = (EncodeT*)listCodes[listId];
     auto numVecs = listLengths[listId];
@@ -85,8 +96,7 @@ __global__ void pqScanInterleaved(
             EncodeT code =
                     WarpPackedBits<EncodeT, EncodeBits>::postRead(laneId, enc);
 
-            dist += valid ? ConvertTo<float>::to(localCodeDistances[sq][code])
-                          : 0;
+            dist += valid ? s_localDistances[sq * numCodes + code] : 0;
             data += wordsPerVectorBlockDim;
         }
 
@@ -96,11 +106,132 @@ __global__ void pqScanInterleaved(
     }
 }
 
+template <typename EncodeT, int EncodeBits, typename CodeDistanceT>
+__global__ void __launch_bounds__(1024) pqScanInterleaved_multiblock(
+        Tensor<float, 2, true> queries,
+        Tensor<float, 3, true> pqCentroids,
+        Tensor<idx_t, 2, true> ivfListIds,
+        Tensor<CodeDistanceT, 4, true> codeDistances,
+        void** listCodes,
+        idx_t* listLengths,
+        Tensor<idx_t, 2, true> prefixSumOffsets,
+        Tensor<float, 1, true> distance) {
+    // Each 4 block handles a single query because probeId incase always be 1
+    auto queryId = blockIdx.y;
+    auto probeId = blockIdx.x / 4;
+    auto probeId_i = blockIdx.x % 4;
+
+
+    idx_t listId = ivfListIds[queryId][probeId];
+    // Safety guard in case NaNs in input cause no list ID to be generated
+    if (listId == -1) {
+        return;
+    }
+
+    int numWarps = blockDim.x / kWarpSize;
+    // FIXME: some issue with getLaneId() and CUDA 10.1 and P4 GPUs?
+    int laneId = threadIdx.x % kWarpSize;
+    int warpId = threadIdx.x / kWarpSize;
+    //32
+    int numSubQuantizers = codeDistances.getSize(2);
+
+    // This is where we start writing out data
+    // We ensure that before the array (at offset -1), there is a 0 value
+
+    auto outBase = *(prefixSumOffsets[queryId][probeId].data() - 1);
+    float* distanceOut = distance[outBase].data();
+
+
+    auto localCodeDistances = codeDistances[queryId][probeId];
+
+    //=========================START
+    int numCodes = codeDistances.getSize(3);
+    int totalElements = numSubQuantizers * numCodes;
+    extern __shared__ float s_localDistances[];
+    for(int i = threadIdx.x; i<totalElements; i+=blockDim.x){
+        int sq = i / numCodes;
+        int code = i % numCodes;
+        s_localDistances[i] = ConvertTo<float>::to(localCodeDistances[sq][code]);
+    }
+    __syncthreads();
+    //=========================END
+
+    // This is where the codes for our list start
+
+    auto vecsBase = (EncodeT*)listCodes[listId];
+
+    auto numVecs = listLengths[listId];
+
+    // How many vector blocks of kWarpSize are in this list?
+    idx_t numBlocks = utils::divUp(numVecs, (idx_t)kWarpSize);
+
+    auto numBlocksDIVF = numBlocks / 4 ;
+
+    auto numBlocksSF = numBlocks % 4 ;
+
+    auto numBlocks_start = probeId_i * numBlocksDIVF;
+
+    // Number of EncodeT words per each dimension of block of kWarpSize vecs
+    constexpr int bytesPerVectorBlockDim = EncodeBits * kWarpSize / 8;
+
+    constexpr int wordsPerVectorBlockDim =
+            bytesPerVectorBlockDim / sizeof(EncodeT);
+    int wordsPerVectorBlock = wordsPerVectorBlockDim * numSubQuantizers;
+
+    for (idx_t block = warpId; block < numBlocksDIVF; block += numWarps) {
+        float dist = 0;
+
+        // This is the vector a given lane/thread handles
+        idx_t vec = (numBlocks_start + block) * kWarpSize + laneId;
+        bool valid = vec < numVecs;
+
+        EncodeT* data = vecsBase + (numBlocks_start + block) * wordsPerVectorBlock;
+
+        for (int sq = 0; sq < numSubQuantizers; ++sq) {
+            EncodeT enc =
+                    WarpPackedBits<EncodeT, EncodeBits>::read(laneId, data);
+            EncodeT code =
+                    WarpPackedBits<EncodeT, EncodeBits>::postRead(laneId, enc);
+
+            dist += valid ? s_localDistances[sq * numCodes + code] : 0;
+            data += wordsPerVectorBlockDim;
+        }
+
+        if (valid) {
+            distanceOut[vec] = dist;
+        }
+    }
+    if(probeId_i == 3){
+        for (idx_t block = warpId; block < numBlocksSF; block += numWarps) {
+        float dist = 0;
+
+        // This is the vector a given lane/thread handles
+        idx_t vec = (numBlocksDIVF * 4 + block) * kWarpSize + laneId;
+        bool valid = vec < numVecs;
+
+        EncodeT* data = vecsBase + ( numBlocksDIVF * 4 + block) * wordsPerVectorBlock;
+
+        for (int sq = 0; sq < numSubQuantizers; ++sq) {
+            EncodeT enc =
+                    WarpPackedBits<EncodeT, EncodeBits>::read(laneId, data);
+            EncodeT code =
+                    WarpPackedBits<EncodeT, EncodeBits>::postRead(laneId, enc);
+
+            dist += valid ? s_localDistances[sq * numCodes + code] : 0;
+            data += wordsPerVectorBlockDim;
+        }
+
+        if (valid) {
+            distanceOut[vec] = dist;
+        }
+    }
+    }
+}
 template <typename LookupT, typename LookupVecT>
 struct LoadCodeDistances {
     static inline __device__ void load(
-            LookupT* smem,
-            LookupT* codes,
+            LookupT* __restrict__ smem,
+            const LookupT* __restrict__ codes,
             int numCodes) {
         constexpr int kWordSize = sizeof(LookupVecT) / sizeof(LookupT);
 
@@ -170,8 +301,14 @@ struct LoadCodeDistances {
     }
 };
 
-template <int NumSubQuantizers, typename LookupT, typename LookupVecT>
-__global__ void pqScanNoPrecomputedMultiPass(
+template <
+        int NumSubQuantizers,
+        typename LookupT,
+        int kThreadsPerBlock,
+        int kItemsPerThread,
+        int kCTAsPerList,
+        typename LookupVecT>
+__global__ void __launch_bounds__(kThreadsPerBlock) pqScanNoPrecomputedMultiPass(
         Tensor<float, 2, true> queries,
         Tensor<float, 3, true> pqCentroids,
         Tensor<idx_t, 2, true> ivfListIds,
@@ -180,20 +317,20 @@ __global__ void pqScanNoPrecomputedMultiPass(
         idx_t* listLengths,
         Tensor<idx_t, 2, true> prefixSumOffsets,
         Tensor<float, 1, true> distance) {
-    const auto codesPerSubQuantizer = pqCentroids.getSize(2);
+    static_assert(kItemsPerThread > 0, "kItemsPerThread must be positive");
+    static_assert(kCTAsPerList > 0, "kCTAsPerList must be positive");
 
-    // Where the pq code -> residual distance is stored
-    extern __shared__ char smemCodeDistances[];
-    LookupT* codeDist = (LookupT*)smemCodeDistances;
-
-    // Each block handles a single query
+    // This kernel is used by the non-interleaved IVFPQ path.  On HCU/ROCm,
+    // long lists are often limited by one CTA walking the whole inverted list.
+    // kCTAsPerList allows the host path to split one (query, probe) list over
+    // several CTAs while preserving the same contiguous distance output layout.
     auto queryId = blockIdx.y;
-    auto probeId = blockIdx.x;
+    int probeId = blockIdx.x / kCTAsPerList;
+    int listBlockId = blockIdx.x - probeId * kCTAsPerList;
 
-    // This is where we start writing out data
-    // We ensure that before the array (at offset -1), there is a 0 value
-    auto outBase = *(prefixSumOffsets[queryId][probeId].data() - 1);
-    float* distanceOut = distance[outBase].data();
+    if (probeId >= ivfListIds.getSize(1)) {
+        return;
+    }
 
     idx_t listId = ivfListIds[queryId][probeId];
     // Safety guard in case NaNs in input cause no list ID to be generated
@@ -201,70 +338,83 @@ __global__ void pqScanNoPrecomputedMultiPass(
         return;
     }
 
-    uint8_t* codeList = (uint8_t*)listCodes[listId];
-    auto limit = listLengths[listId];
+    const int codesPerSubQuantizer = codeDistances.getSize(3);
+    uint8_t* __restrict__ codeList = (uint8_t*)listCodes[listId];
+    idx_t limit = listLengths[listId];
 
-    constexpr int kNumCode32 =
-            NumSubQuantizers <= 4 ? 1 : (NumSubQuantizers / 4);
-    unsigned int code32[kNumCode32];
-    unsigned int nextCode32[kNumCode32];
-
-    // We double-buffer the code loading, which improves memory utilization
-    if (threadIdx.x < limit) {
-        LoadCode32<NumSubQuantizers>::load(code32, codeList, threadIdx.x);
+    if (limit <= 0) {
+        return;
     }
+
+    // This is where we start writing out data
+    // We ensure that before the array (at offset -1), there is a 0 value
+    auto outBase = *(prefixSumOffsets[queryId][probeId].data() - 1);
+    float* __restrict__ distanceOut = distance[outBase].data();
+
+    // Where the pq code -> residual distance is stored. Keeping the lookup
+    // table in LDS is still faster on HCU than repeatedly reading global
+    // memory, even when several CTAs split the same long list.
+    extern __shared__ char smemCodeDistances[];
+    LookupT* __restrict__ codeDist = (LookupT*)smemCodeDistances;
 
     LoadCodeDistances<LookupT, LookupVecT>::load(
             codeDist,
             codeDistances[queryId][probeId].data(),
-            codeDistances.getSize(2) * codeDistances.getSize(3));
+            NumSubQuantizers * codesPerSubQuantizer);
 
-    // Prevent WAR dependencies
     __syncthreads();
 
-    // Each thread handles one code element in the list, with a
-    // block-wide stride
-    for (idx_t codeIndex = threadIdx.x; codeIndex < limit;
-         codeIndex += blockDim.x) {
-        // Prefetch next codes
-        if (codeIndex + blockDim.x < limit) {
-            LoadCode32<NumSubQuantizers>::load(
-                    nextCode32, codeList, codeIndex + blockDim.x);
-        }
+    constexpr int kNumCode32 =
+            NumSubQuantizers <= 4 ? 1 : (NumSubQuantizers / 4);
+    constexpr int kBytesPerCode32 =
+            NumSubQuantizers < 4 ? NumSubQuantizers : 4;
 
-        float dist = 0.0f;
+    unsigned int code32[kNumCode32];
+
+    const idx_t codesPerTile =
+            (idx_t)kThreadsPerBlock * (idx_t)kItemsPerThread;
+    const idx_t firstTile = (idx_t)listBlockId * codesPerTile;
+    const idx_t tileStride = (idx_t)kCTAsPerList * codesPerTile;
+
+    // Each CTA scans a disjoint set of contiguous tiles.  kItemsPerThread gives
+    // each thread a small amount of serial work, reducing loop overhead and
+    // improving LDS/code-load reuse without increasing register pressure as much
+    // as the old double-buffered path.
+    for (idx_t tileBase = firstTile; tileBase < limit; tileBase += tileStride) {
+#pragma unroll
+        for (int item = 0; item < kItemsPerThread; ++item) {
+            idx_t codeIndex = tileBase +
+                    (idx_t)item * (idx_t)kThreadsPerBlock + threadIdx.x;
+
+            if (codeIndex >= limit) {
+                continue;
+            }
+
+            LoadCode32<NumSubQuantizers>::load(code32, codeList, codeIndex);
+
+            float dist = 0.0f;
 
 #pragma unroll
-        for (int word = 0; word < kNumCode32; ++word) {
-            constexpr int kBytesPerCode32 =
-                    NumSubQuantizers < 4 ? NumSubQuantizers : 4;
-
-            if (kBytesPerCode32 == 1) {
-                auto code = code32[0];
-                dist = ConvertTo<float>::to(codeDist[code]);
-
-            } else {
+            for (int word = 0; word < kNumCode32; ++word) {
+                if (kBytesPerCode32 == 1) {
+                    auto code = code32[0];
+                    dist = ConvertTo<float>::to(codeDist[code]);
+                } else {
 #pragma unroll
-                for (int byte = 0; byte < kBytesPerCode32; ++byte) {
-                    auto code = getByte(code32[word], byte * 8, 8);
+                    for (int byte = 0; byte < kBytesPerCode32; ++byte) {
+                        auto code = getByte(code32[word], byte * 8, 8);
+                        auto offset = codesPerSubQuantizer *
+                                (word * kBytesPerCode32 + byte);
 
-                    auto offset = codesPerSubQuantizer *
-                            (word * kBytesPerCode32 + byte);
-
-                    dist += ConvertTo<float>::to(codeDist[offset + code]);
+                        dist += ConvertTo<float>::to(codeDist[offset + code]);
+                    }
                 }
             }
-        }
 
-        // Write out intermediate distance result
-        // We do not maintain indices here, in order to reduce global
-        // memory traffic. Those are recovered in the final selection step.
-        distanceOut[codeIndex] = dist;
-
-        // Rotate buffers
-#pragma unroll
-        for (int word = 0; word < kNumCode32; ++word) {
-            code32[word] = nextCode32[word];
+            // Write out intermediate distance result. We do not maintain
+            // indices here, in order to reduce global memory traffic. Those
+            // are recovered in the final selection step.
+            distanceOut[codeIndex] = dist;
         }
     }
 }
@@ -288,6 +438,7 @@ void runMultiPassTile(
         DeviceVector<void*>& listIndices,
         IndicesOptions indicesOptions,
         DeviceVector<idx_t>& listLengths,
+        idx_t maxListLength,
         Tensor<char, 1, true>& thrustMem,
         Tensor<idx_t, 2, true>& prefixSumOffsets,
         Tensor<float, 1, true>& allDistances,
@@ -332,16 +483,85 @@ void runMultiPassTile(
             stream);
 
     if (interleavedCodeLayout) {
-        // The vector interleaved layout implementation
-        auto kThreadsPerBlock = 256;
 
+    if(coarseIndices.getSize(1) == 1){
+
+        auto kThreadsPerBlock = 1024;
+        int numSubQuantizers = codeDistances.getSize(2);
+        int numSubQuantizerCodes = codeDistances.getSize(3);
+        size_t ldsBytes = numSubQuantizers * numSubQuantizerCodes * sizeof(float);
+        auto grid = dim3(coarseIndices.getSize(1)  * 4 , coarseIndices.getSize(0));
+        auto block = dim3(kThreadsPerBlock);
+
+#define RUN_INTERLEAVED_multiblock(BITS_PER_CODE, CODE_DIST_T)            \
+    do {                                                                  \
+        pqScanInterleaved_multiblock<uint8_t, BITS_PER_CODE, CODE_DIST_T> \
+                <<<grid, block, ldsBytes, stream>>>(                      \
+                        queries,                               \
+                        pqCentroidsInnermostCode,              \
+                        coarseIndices,                         \
+                        codeDistancesT,                        \
+                        listCodes.data(),                      \
+                        listLengths.data(),                    \
+                        prefixSumOffsets,                      \
+                        allDistances);                         \
+    } while (0)
+
+        if (useFloat16Lookup) {
+            auto codeDistancesT = codeDistances.toTensor<half>();
+
+            switch (bitsPerSubQuantizer) {
+                case 4: {
+                    RUN_INTERLEAVED_multiblock(4, half);
+                } break;
+                case 5: {
+                    RUN_INTERLEAVED_multiblock(5, half);
+                } break;
+                case 6: {
+                    RUN_INTERLEAVED_multiblock(6, half);
+                } break;
+                case 8: {
+                    RUN_INTERLEAVED_multiblock(8, half);
+                } break;
+                default:
+                    FAISS_ASSERT(false);
+                    break;
+            }
+        } else {
+            auto codeDistancesT = codeDistances.toTensor<float>();
+
+            switch (bitsPerSubQuantizer) {
+                case 4: {
+                    RUN_INTERLEAVED_multiblock(4, float);
+                } break;
+                case 5: {
+                    RUN_INTERLEAVED_multiblock(5, float);
+                } break;
+                case 6: {
+                    RUN_INTERLEAVED_multiblock(6, float);
+                } break;
+                case 8: {
+                    RUN_INTERLEAVED_multiblock(8, float);
+                } break;
+                default:
+                    FAISS_ASSERT(false);
+                    break;
+            }
+        }
+    }
+    else{
+        // The vector interleaved layout implementation
+        auto kThreadsPerBlock = 1024;
+        int numSubQuantizers = codeDistances.getSize(2);
+        int numSubQuantizerCodes = codeDistances.getSize(3);
+        size_t ldsBytes = numSubQuantizers * numSubQuantizerCodes * sizeof(float);
         auto grid = dim3(coarseIndices.getSize(1), coarseIndices.getSize(0));
         auto block = dim3(kThreadsPerBlock);
 
 #define RUN_INTERLEAVED(BITS_PER_CODE, CODE_DIST_T)            \
     do {                                                       \
         pqScanInterleaved<uint8_t, BITS_PER_CODE, CODE_DIST_T> \
-                <<<grid, block, 0, stream>>>(                  \
+                <<<grid, block, ldsBytes, stream>>>(                  \
                         queries,                               \
                         pqCentroidsInnermostCode,              \
                         coarseIndices,                         \
@@ -393,12 +613,22 @@ void runMultiPassTile(
                     break;
             }
         }
+    }
+
     } else {
         // Convert all codes to a distance, and write out (distance,
-        // index) values for all intermediate results
-        auto kThreadsPerBlock = 256;
+        // index) values for all intermediate results.
+        //
+        // HCU optimization: for a single probed list with a long inverted
+        // list, split one list over several CTAs. The output is still written
+        // to the original distanceOut[codeIndex] slot, so the later selection
+        // passes do not need any layout changes. kItemsPerThread increases
+        // useful work per wavefront and amortizes LDS lookup-table loading.
+        constexpr int kThreadsPerBlock = 512;
+        constexpr int kItemsPerThread = 2;
+        int scanBlocksPerList =
+                (coarseIndices.getSize(1) == 1 && maxListLength >= 4096) ? 4 : 1;
 
-        auto grid = dim3(coarseIndices.getSize(1), coarseIndices.getSize(0));
         auto block = dim3(kThreadsPerBlock);
 
         // pq centroid distances
@@ -407,12 +637,20 @@ void runMultiPassTile(
         smem *= numSubQuantizers * numSubQuantizerCodes;
         FAISS_ASSERT(smem <= getMaxSharedMemPerBlockCurrentDevice());
 
-#define RUN_PQ_OPT(NUM_SUB_Q, LOOKUP_T, LOOKUP_VEC_T)                   \
+#define RUN_PQ_OPT(NUM_SUB_Q, LOOKUP_T, LOOKUP_VEC_T, CTAS_PER_LIST)    \
     do {                                                                \
         auto codeDistancesT = codeDistances.toTensor<LOOKUP_T>();       \
+        auto grid = dim3(                                                \
+                coarseIndices.getSize(1) * CTAS_PER_LIST,               \
+                coarseIndices.getSize(0));                              \
                                                                         \
-        pqScanNoPrecomputedMultiPass<NUM_SUB_Q, LOOKUP_T, LOOKUP_VEC_T> \
-                <<<grid, block, smem, stream>>>(                        \
+        pqScanNoPrecomputedMultiPass<                                   \
+                NUM_SUB_Q,                                               \
+                LOOKUP_T,                                                \
+                kThreadsPerBlock,                                        \
+                kItemsPerThread,                                         \
+                CTAS_PER_LIST,                                           \
+                LOOKUP_VEC_T><<<grid, block, smem, stream>>>(           \
                         queries,                                        \
                         pqCentroidsInnermostCode,                       \
                         coarseIndices,                                  \
@@ -423,12 +661,21 @@ void runMultiPassTile(
                         allDistances);                                  \
     } while (0)
 
-#define RUN_PQ(NUM_SUB_Q)                         \
+#define RUN_PQ_CTAS(NUM_SUB_Q, CTAS_PER_LIST)     \
     do {                                          \
         if (useFloat16Lookup) {                   \
-            RUN_PQ_OPT(NUM_SUB_Q, half, Half8);   \
+            RUN_PQ_OPT(NUM_SUB_Q, half, Half8, CTAS_PER_LIST);   \
         } else {                                  \
-            RUN_PQ_OPT(NUM_SUB_Q, float, float4); \
+            RUN_PQ_OPT(NUM_SUB_Q, float, float4, CTAS_PER_LIST); \
+        }                                         \
+    } while (0)
+
+#define RUN_PQ(NUM_SUB_Q)                         \
+    do {                                          \
+        if (scanBlocksPerList == 4) {             \
+            RUN_PQ_CTAS(NUM_SUB_Q, 4);            \
+        } else {                                  \
+            RUN_PQ_CTAS(NUM_SUB_Q, 1);            \
         }                                         \
     } while (0)
 
@@ -487,6 +734,7 @@ void runMultiPassTile(
         }
 
 #undef RUN_PQ
+#undef RUN_PQ_CTAS
 #undef RUN_PQ_OPT
     }
 
@@ -502,7 +750,8 @@ void runMultiPassTile(
             !l2Distance, // L2 distance chooses smallest
             heapDistances,
             heapIndices,
-            stream);
+            stream,
+            interleavedCodeLayout);
 
     // k-select final output
     auto flatHeapDistances = heapDistances.downcastInner<2>();
@@ -721,6 +970,7 @@ void runPQScanMultiPassNoPrecomputed(
                 listIndices,
                 indicesOptions,
                 listLengths,
+                maxListLength,
                 *thrustMem[curStream],
                 prefixSumOffsetsView,
                 *allDistances[curStream],

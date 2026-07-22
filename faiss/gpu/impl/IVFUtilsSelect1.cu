@@ -27,7 +27,7 @@ template <
         int NumWarpQ,
         int NumThreadQ,
         bool Dir>
-__global__ void pass1SelectLists(
+__global__ __launch_bounds__(1024) void pass1SelectLists(
         Tensor<idx_t, 2, true> prefixSumOffsets,
         Tensor<float, 1, true> distance,
         int nprobe,
@@ -98,6 +98,106 @@ __global__ void pass1SelectLists(
     }
 }
 
+using floatx4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+template <size_t len>
+union f32x4_vec {
+    floatx4   vec[len/4];
+    float     data[len];
+};
+template <
+        typename IndexT,
+        int ThreadsPerBlock,
+        int NumWarpQ,
+        int NumThreadQ,
+        bool Dir>
+__global__   __launch_bounds__(512) void pass1SelectLists2(
+        Tensor<idx_t, 2, true> prefixSumOffsets,
+        Tensor<float, 1, true> distance,
+        int nprobe,
+        int k,
+        Tensor<float, 3, true> heapDistances,
+        Tensor<idx_t, 3, true> heapIndices) {
+    if constexpr ((NumWarpQ == 1 && NumThreadQ == 1) || NumWarpQ >= kWarpSize) {
+        constexpr int kNumWarps = ThreadsPerBlock / kWarpSize;
+
+        __shared__ float smemK[kNumWarps * NumWarpQ];
+        __shared__ IndexT smemV[kNumWarps * NumWarpQ];
+
+        for (IndexT queryId = blockIdx.y; queryId < prefixSumOffsets.getSize(0);
+             queryId += gridDim.y) {
+            constexpr auto kInit = Dir ? kFloatMin : kFloatMax;
+            BlockSelect<
+                    float,
+                    IndexT,
+                    Dir,
+                    Comparator<float>,
+                    NumWarpQ,
+                    NumThreadQ,
+                    ThreadsPerBlock>
+                    heap(kInit, -1, smemK, smemV, k);
+
+            auto sliceId = blockIdx.x;
+            auto numSlices = gridDim.x;
+
+            IndexT sliceSize = (nprobe / numSlices);
+            IndexT sliceStart = sliceSize * sliceId;
+            IndexT sliceEnd = sliceId == (numSlices - 1)
+                    ? nprobe
+                    : sliceStart + sliceSize;
+            auto offsets = prefixSumOffsets[queryId].data();
+
+            // We ensure that before the array (at offset -1), there is a 0
+            // value
+            auto start = *(&offsets[sliceStart] - 1);
+            auto end = offsets[sliceEnd - 1];
+
+            auto num = end - start;
+            auto limit = utils::roundDown(num, (IndexT)4 * ThreadsPerBlock);
+
+            IndexT i = threadIdx.x * 4;
+            auto distanceStart = distance[start].data();
+
+            // BlockSelect add cannot be used in a warp divergent circumstance;
+            // we handle the remainder warp below
+            f32x4_vec<4> distance_data;
+            for (; i < limit; i += blockDim.x * 4) {
+                distance_data.vec[0] = *(floatx4*)(distanceStart + i);
+                for(int j = 0; j < 4; j++ ){
+                    heap.add(*(float*)(&(distance_data.data[j])), IndexT(start + i + j));
+                }
+            }
+
+            //TEST_ORIGINAL
+            auto limit2 = utils::roundDown((num-limit), (IndexT)kWarpSize);
+            IndexT i2 = limit + threadIdx.x;
+            //auto distanceStart = distance[start].data();
+            for (; i2 < (limit +limit2); i2 += blockDim.x) {
+                heap.add(distanceStart[i2], IndexT(start + i2));
+            }
+
+            //auto limit2 = utils::roundDown(num, (IndexT)kWarpSize);
+            //IndexT i2 = threadIdx.x;
+            //auto distanceStart = distance[start].data();
+            //for (; i2 < limit2; i2 += blockDim.x) {
+                //heap.add(distanceStart[i2], IndexT(start + i2));
+            //}
+            // Handle the remainder if any separately (warp is divergent)
+            if(i2<num){
+                heap.addThreadQ(distanceStart[i2],IndexT(start + i2));
+            }
+            // Merge all final results in lds
+            heap.reduce();
+
+            // Write out the final k-selected values; they should be all
+            // together
+            for (int i = threadIdx.x; i < k; i += blockDim.x) {
+                heapDistances[queryId][sliceId][i] = smemK[i];
+                heapIndices[queryId][sliceId][i] = idx_t(smemV[i]);
+            }
+        }
+    }
+}
+
 void runPass1SelectLists(
         Tensor<idx_t, 2, true>& prefixSumOffsets,
         Tensor<float, 1, true>& distance,
@@ -107,7 +207,8 @@ void runPass1SelectLists(
         bool chooseLargest,
         Tensor<float, 3, true>& heapDistances,
         Tensor<idx_t, 3, true>& heapIndices,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        bool keyconfig) {
     // This is also caught at a higher level
     FAISS_ASSERT(k <= GPU_MAX_SELECTION_K);
 
@@ -119,7 +220,7 @@ void runPass1SelectLists(
 
 #define RUN_PASS(INDEX_T, BLOCK, NUM_WARP_Q, NUM_THREAD_Q, DIR)         \
     do {                                                                \
-        pass1SelectLists<INDEX_T, BLOCK, NUM_WARP_Q, NUM_THREAD_Q, DIR> \
+        pass1SelectLists2<INDEX_T, BLOCK, NUM_WARP_Q, NUM_THREAD_Q, DIR> \
                 <<<grid, BLOCK, 0, stream>>>(                           \
                         prefixSumOffsets,                               \
                         distance,                                       \
@@ -138,11 +239,13 @@ void runPass1SelectLists(
         if (k == 1) {                                             \
             RUN_PASS(INDEX_T, 128, 1, 1, DIR);                    \
         } else if (k <= 32 && getWarpSizeCurrentDevice() == 32) { \
-            RUN_PASS(INDEX_T, 128, 32, 2, DIR);                   \
+            RUN_PASS(INDEX_T, 256, 32, 2, DIR);                   \
         } else if (k <= 64) {                                     \
-            RUN_PASS(INDEX_T, 128, 64, 3, DIR);                   \
-        } else if (k <= 128) {                                    \
-            RUN_PASS(INDEX_T, 128, 128, 3, DIR);                  \
+            RUN_PASS(INDEX_T, 512, 64, 2, DIR);                   \
+        } else if (k <= 128 && keyconfig) {                       \
+            RUN_PASS(INDEX_T, 512, 128, 4, DIR);                  \
+        } else if (k <= 128 && !keyconfig) {                      \
+            RUN_PASS(INDEX_T, 128, 128, 4, DIR);                  \
         } else if (k <= 256) {                                    \
             RUN_PASS(INDEX_T, 128, 256, 4, DIR);                  \
         } else if (k <= 512) {                                    \
@@ -161,11 +264,13 @@ void runPass1SelectLists(
         if (k == 1) {                                             \
             RUN_PASS(INDEX_T, 128, 1, 1, DIR);                    \
         } else if (k <= 32 && getWarpSizeCurrentDevice() == 32) { \
-            RUN_PASS(INDEX_T, 128, 32, 2, DIR);                   \
+            RUN_PASS(INDEX_T, 256, 32, 2, DIR);                   \
         } else if (k <= 64) {                                     \
-            RUN_PASS(INDEX_T, 128, 64, 3, DIR);                   \
-        } else if (k <= 128) {                                    \
-            RUN_PASS(INDEX_T, 128, 128, 3, DIR);                  \
+            RUN_PASS(INDEX_T, 512, 64, 2, DIR);                   \
+        } else if (k <= 128 && keyconfig) {                       \
+            RUN_PASS(INDEX_T, 512, 128, 4, DIR);                  \
+        } else if (k <= 128 && !keyconfig) {                      \
+            RUN_PASS(INDEX_T, 128, 128, 4, DIR);                  \
         } else if (k <= 256) {                                    \
             RUN_PASS(INDEX_T, 128, 256, 4, DIR);                  \
         } else if (k <= 512) {                                    \

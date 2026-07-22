@@ -52,6 +52,7 @@ template <
         int NumWarpQ,
         int NumThreadQ,
         bool Dir>
+__launch_bounds__(1024)
 __global__ void pass2SelectLists(
         Tensor<float, 2, true> heapDistances,
         Tensor<idx_t, 2, true> heapIndices,
@@ -195,9 +196,9 @@ void runPass2SelectLists(
         if (k == 1) {                                             \
             RUN_PASS(INDEX_T, 128, 1, 1, DIR);                    \
         } else if (k <= 32 && getWarpSizeCurrentDevice() == 32) { \
-            RUN_PASS(INDEX_T, 128, 32, 2, DIR);                   \
+            RUN_PASS(INDEX_T, 256, 32, 2, DIR);                   \
         } else if (k <= 64) {                                     \
-            RUN_PASS(INDEX_T, 128, 64, 3, DIR);                   \
+            RUN_PASS(INDEX_T, 256, 64, 2, DIR);                   \
         } else if (k <= 128) {                                    \
             RUN_PASS(INDEX_T, 128, 128, 3, DIR);                  \
         } else if (k <= 256) {                                    \
@@ -218,9 +219,9 @@ void runPass2SelectLists(
         if (k == 1) {                                             \
             RUN_PASS(INDEX_T, 128, 1, 1, DIR);                    \
         } else if (k <= 32 && getWarpSizeCurrentDevice() == 32) { \
-            RUN_PASS(INDEX_T, 128, 32, 2, DIR);                   \
+            RUN_PASS(INDEX_T, 256, 32, 2, DIR);                   \
         } else if (k <= 64) {                                     \
-            RUN_PASS(INDEX_T, 128, 64, 3, DIR);                   \
+            RUN_PASS(INDEX_T, 256, 64, 2, DIR);                   \
         } else if (k <= 128) {                                    \
             RUN_PASS(INDEX_T, 128, 128, 3, DIR);                  \
         } else if (k <= 256) {                                    \

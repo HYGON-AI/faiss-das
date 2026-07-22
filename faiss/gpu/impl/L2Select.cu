@@ -134,6 +134,7 @@ template <
         int NumWarpQ,
         int NumThreadQ,
         int ThreadsPerBlock>
+__launch_bounds__(1024)
 __global__ void l2SelectMinK(
         Tensor<T, 2, true> productDistances,
         Tensor<T, 1, true> centroidDistances,
@@ -246,9 +247,9 @@ void runL2SelectMin(
         if (k <= 32 && getWarpSizeCurrentDevice() == 32) {
             RUN_L2_SELECT(128, 32, 2);
         } else if (k <= 64) {
-            RUN_L2_SELECT(128, 64, 3);
+            RUN_L2_SELECT(128, 64, 2);
         } else if (k <= 128) {
-            RUN_L2_SELECT(128, 128, 3);
+            RUN_L2_SELECT(512, 128, 3);
         } else if (k <= 256) {
             RUN_L2_SELECT(128, 256, 4);
         } else if (k <= 512) {

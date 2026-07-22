@@ -128,6 +128,7 @@ size_t getIVFQueryTileSize(
 
 // Calculates the total number of intermediate distances to consider
 // for all queries
+__launch_bounds__(1024)
 __global__ void getResultLengths(
         Tensor<idx_t, 2, true> ivfListIds,
         idx_t* listLengths,

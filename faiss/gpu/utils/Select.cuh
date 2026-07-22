@@ -168,7 +168,7 @@ struct BlockSelect {
                 utils::isPowerOf2(NumWarpQ), "warp queue must be power-of-2");
 
         // Fill the per-thread queue keys with the default value
-#pragma unroll
+// #pragma unroll
         for (int i = 0; i < NumThreadQ; ++i) {
             threadK[i] = initK;
             threadV[i] = initV;
@@ -186,13 +186,13 @@ struct BlockSelect {
             warpV[i] = initV;
         }
 
-        warpFence();
+        // warpFence();
     }
 
     __device__ inline void addThreadQ(K k, V v) {
         if (Dir ? Comp::gt(k, warpKTop) : Comp::lt(k, warpKTop)) {
             // Rotate right
-#pragma unroll
+// #pragma unroll
             for (int i = NumThreadQ - 1; i > 0; --i) {
                 threadK[i] = threadK[i - 1];
                 threadV[i] = threadV[i - 1];
@@ -225,7 +225,7 @@ struct BlockSelect {
         // free to reset the thread queues
         numVals = 0;
 
-#pragma unroll
+// #pragma unroll
         for (int i = 0; i < NumThreadQ; ++i) {
             threadK[i] = initK;
             threadV[i] = initV;
@@ -234,7 +234,7 @@ struct BlockSelect {
         // We have to beat at least this element
         warpKTop = warpK[kMinus1];
 
-        warpFence();
+        // warpFence();
     }
 
     /// This function handles sorting and merging together the
@@ -250,13 +250,13 @@ struct BlockSelect {
         K warpKRegisters[kNumWarpQRegisters];
         V warpVRegisters[kNumWarpQRegisters];
 
-#pragma unroll
+// #pragma unroll
         for (int i = 0; i < kNumWarpQRegisters; ++i) {
             warpKRegisters[i] = warpK[i * kWarpSize + laneId];
             warpVRegisters[i] = warpV[i * kWarpSize + laneId];
         }
 
-        warpFence();
+        // warpFence();
 
         // The warp queue is already sorted, and now that we've sorted the
         // per-thread queue, merge both sorted lists together, producing
@@ -271,13 +271,13 @@ struct BlockSelect {
                 false>(warpKRegisters, warpVRegisters, threadK, threadV);
 
         // Write back out the warp queue
-#pragma unroll
+// #pragma unroll
         for (int i = 0; i < kNumWarpQRegisters; ++i) {
             warpK[i * kWarpSize + laneId] = warpKRegisters[i];
             warpV[i * kWarpSize + laneId] = warpVRegisters[i];
         }
 
-        warpFence();
+        // warpFence();
     }
 
     /// WARNING: all threads in a warp must participate in this.

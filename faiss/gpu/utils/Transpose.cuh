@@ -75,6 +75,7 @@ TensorInfo<T> getTensorInfo(const Tensor<T, Dim, true>& t) {
 }
 
 template <typename T, int DimInput, int DimOutput>
+__launch_bounds__(1024)
 __global__ void transposeAny(
         TensorInfo<T> input,
         TensorInfo<T> output,
@@ -85,7 +86,7 @@ __global__ void transposeAny(
         auto outputOffset = TensorInfoOffset<T, DimOutput>::get(output, i);
 
 #if __CUDA_ARCH__ >= 350 || defined(USE_AMD_ROCM)
-        output.data[outputOffset] = __ldg(&input.data[inputOffset]);
+        output.data[outputOffset] = input.data[inputOffset];
 #else
         output.data[outputOffset] = input.data[inputOffset];
 #endif

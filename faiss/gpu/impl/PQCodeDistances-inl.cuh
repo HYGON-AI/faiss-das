@@ -25,7 +25,13 @@ namespace gpu {
 #else
 #define LAUNCH_BOUND 288
 #endif
+using floatx4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 
+template <size_t len>
+union f32x4_vec {
+    floatx4   vec[len/4];
+    float     data[len];
+};
 // Kernel responsible for calculating distance from residual vector to
 // each product quantizer code centroid
 template <
@@ -72,30 +78,259 @@ __global__ void __launch_bounds__(LAUNCH_BOUND, 3) pqCodeDistances(
 
     // Where we store our residual vector; this is double buffered so we
     // can be loading the next one while processing the current one
-    float* smemResidual1 = &smemQuery[DimsPerSubQuantizer];
-    float* smemResidual2 = &smemResidual1[DimsPerSubQuantizer];
+    float* smemResidual1 = &smemQuery[DimsPerSubQuantizer*2];
+    float* smemResidual2 = &smemResidual1[DimsPerSubQuantizer*2];
 
     // Where we pre-load the coarse centroid IDs
-    int* coarseIds = (int*)&smemResidual2[DimsPerSubQuantizer];
+    int* coarseIds = (int*)&smemResidual2[DimsPerSubQuantizer*2];
 
     // Each thread is calculating the distance for a single code,
     // performing the reductions locally
 
-    // Handle multiple queries per block
+    // Handle multiple queries per block 每个block处理多个query
+    //计算当前线程块负责处理的query的数量 最多限定为16个
     auto startQueryId = idx_t(blockIdx.x) * queriesPerBlock;
     auto numQueries = queries.getSize(0) - startQueryId;
     if (numQueries > queriesPerBlock) {
         numQueries = queriesPerBlock;
     }
+    auto numQueries1 = (numQueries / 2) * 2;
+    int query = 0;
+    //考虑一次处理2个query，这样能减少一些访存
+    for (; query < numQueries1; query+=2) {
 
-    for (int query = 0; query < numQueries; ++query) {
+        //一个一个query处理，单次处理1个query
+        idx_t queryId[2];
+        queryId[0] = startQueryId + query;
+        queryId[1] = startQueryId + query + 1;
+
+        //对应的子向量 维度为8
+        float* querySubQuantizer[2];
+        querySubQuantizer[0] = queries[queryId[0]][subQuantizer * DimsPerSubQuantizer].data();
+        querySubQuantizer[1] = queries[queryId[1]][subQuantizer * DimsPerSubQuantizer].data();
+        // Load current query vector 读取对应子向量的8个维度，根据任务划分确定当前的子向量 这里也就申请了8个空间，还是非常少的，读取的时候很浪费我们的线程带宽，明显可以申请更多lds读取更多数据
+        int DimPSQsizex2 =  DimsPerSubQuantizer * 2;
+
+        for (int i = threadIdx.x; i < DimPSQsizex2; i += blockDim.x) {
+            //多线程并行读取到lds上，但仅有8个数据，是的，这里只有8个数据 现在翻倍处理 2个query有16个数据
+            smemQuery[i] = querySubQuantizer[i/DimsPerSubQuantizer][i%DimsPerSubQuantizer];
+
+            //前8个元素是query0 后8个元素是query1对应的code 连续存储16个浮点值
+        }
+        auto nprobe = coarseIndices.getSize(1);//假设为128
+
+        // Load list of coarse centroids found
+        for (int i = threadIdx.x; i < (nprobe*2); i += blockDim.x) {
+            // FIXME: coarseIndices is now idx_t but the smem allocation
+            // of coarseIds is still int. In practical limitation, everything
+            // should still fit into int32
+            //读取到lds 把当前query对应的128个index读取到lds中共享使用
+            coarseIds[i] = (int)coarseIndices[ (i / nprobe) + query + startQueryId][i % nprobe];
+            //前128个是query0的index 后128个是query1的index 这还是连续访存
+        }
+
+        // We need coarseIds below
+        // FIXME: investigate loading separately, so we don't need this
+        __syncthreads();
+
+        // Preload first buffer of residual data 减去残差？？ 最后64个线程处理
+        if (isLoadingThread) {
+            for (int i = loadingThreadId; i < DimPSQsizex2; i += blockDim.x - codesPerSubQuantizer) {
+
+                auto coarseId = coarseIds[(i / DimsPerSubQuantizer) * nprobe];
+                // In case NaNs were in the original query data
+                coarseId = coarseId == -1 ? 0 : coarseId;
+
+                //读取粗筛阶段当前query对应的128个最相似向量中第一个向量的子向量
+                auto coarseCentroidSubQuantizer =
+                        coarseCentroids[coarseId]
+                                       [subQuantizer * dimsPerSubQuantizer]
+                                               .data();
+                //直接做减法？
+                if (L2Distance) {
+                    smemResidual1[i] = smemQuery[i] -
+                            ConvertTo<float>::to(coarseCentroidSubQuantizer[i % DimsPerSubQuantizer]);
+                    //前8个存储的是query0的后8个存储的是query1的
+                } else {
+                    smemResidual1[i] =
+                            ConvertTo<float>::to(coarseCentroidSubQuantizer[i % DimsPerSubQuantizer]);
+                }
+            }
+        }
+
+        // The block walks the list for a single query 分别处理这2个query的nprobe个向量 一次处理2个query
+        for (int coarse = 0; coarse < nprobe; ++coarse) {
+            // Wait for smemResidual1 to be loaded
+            __syncthreads();
+
+            if (isLoadingThread) {
+                // Preload second buffer of residual data
+                for (int i = loadingThreadId; i < DimPSQsizex2; i += blockDim.x - codesPerSubQuantizer) {
+                    // FIXME: try always making this centroid id 0 so we can
+                    // terminate//之前第一个处理过了，现在处理剩下的
+                    if (coarse != (nprobe - 1)) {
+
+                        auto coarseId = coarseIds[ coarse + 1 + (i / DimsPerSubQuantizer) * nprobe ];
+                        // In case NaNs were in the original query data
+                        coarseId = coarseId == -1 ? 0 : coarseId;
+
+                        auto coarseCentroidSubQuantizer =
+                                coarseCentroids[coarseId]
+                                               [subQuantizer *
+                                                dimsPerSubQuantizer]
+                                                       .data();
+
+                        if (L2Distance) {
+                            smemResidual2[i] =
+                                    smemQuery[i] -
+                                    ConvertTo<float>::to(
+                                            coarseCentroidSubQuantizer[i % DimsPerSubQuantizer]);
+                        } else {
+                            smemResidual2[i] = ConvertTo<float>::to(
+                                    coarseCentroidSubQuantizer[i % DimsPerSubQuantizer]);
+                        }
+                    }
+                }
+            } else {
+                // These are the processing threads 256个线程处理1个query的逻辑
+                float dist[2] = {0.0f,0.0f};
+
+                constexpr int kUnroll = 4;
+                constexpr int kRemainder = DimsPerSubQuantizer % kUnroll; //0
+                constexpr int kRemainderBase = DimsPerSubQuantizer - kRemainder; //8
+                float vals[2][kUnroll];
+                f32x4_vec<(kUnroll * 2)> vals_v;
+                // Calculate residual - pqCentroid for each dim that we're
+                // processing
+
+                // Unrolled loop
+                if (L2Distance) { //查询的8个dim - 残差 -码本 的平方的累加到dist
+                    #pragma unroll
+                    for (int i = 0; i < DimsPerSubQuantizer / kUnroll; ++i) { //8个元素，迭代2次处理，节省空间？
+                        vals_v.vec[0] = *(floatx4*)(smemResidual1 + (i * kUnroll));
+                        vals_v.vec[1] = *(floatx4*)(smemResidual1 + DimsPerSubQuantizer + (i * kUnroll));
+                        #pragma unroll
+                        for (int j = 0; j < kUnroll; ++j) {
+                            vals_v.data[j] -= subQuantizerData[i * kUnroll + j]; //这是减去码本值
+                            vals_v.data[j + 4] -= subQuantizerData[i * kUnroll + j];
+                        }
+
+                        #pragma unroll
+                        for (int j = 0; j < kUnroll; ++j) {
+                            vals_v.data[j] *= vals_v.data[j]; //获取平方
+                            vals_v.data[j+4] *= vals_v.data[j+4];
+                        }
+
+                        #pragma unroll
+                        for (int j = 0; j < kUnroll; ++j) {
+                            dist[0] += vals_v.data[j]; //累加
+                            dist[1] += vals_v.data[j+4];
+                        }
+                    }
+                } else {
+                    // Inner product: query slice against the reconstructed
+                    // sub-quantizer for this coarse cell (query o (centroid +
+                    // subQCentroid))
+                    #pragma unroll
+                    for (int i = 0; i < DimsPerSubQuantizer / kUnroll; ++i) {
+
+                        vals_v.vec[0] = *(floatx4*)(smemResidual1 + (i * kUnroll));
+                        vals_v.vec[1] = *(floatx4*)(smemResidual1 + DimsPerSubQuantizer + (i * kUnroll));
+                        #pragma unroll
+                        for (int j = 0; j < kUnroll; ++j) {
+                            vals_v.data[j] -= subQuantizerData[i * kUnroll + j]; //这是减去码本值
+                            vals_v.data[j + 4] -= subQuantizerData[i * kUnroll + j];
+                        }
+
+                        #pragma unroll
+                        for (int j = 0; j < kUnroll; ++j) {
+                            vals_v.data[j] *= smemQuery[i * kUnroll + j]; //获取平方
+                            vals_v.data[j+4] *= smemQuery[DimsPerSubQuantizer + i * kUnroll + j];
+                        }
+
+                        #pragma unroll
+                        for (int j = 0; j < kUnroll; ++j) {
+                            dist[0] += vals_v.data[j]; //累加
+                            dist[1] += vals_v.data[j+4];
+                        }
+                    }
+                }
+
+                // Remainder loop
+                if (L2Distance) {
+                    #pragma unroll
+                    for (int j = 0; j < kRemainder; ++j) {
+                        vals[0][j] = smemResidual1[kRemainderBase + j];
+                        vals[1][j] = smemResidual1[DimsPerSubQuantizer + kRemainderBase + j];
+                    }
+
+                    #pragma unroll
+                    for (int j = 0; j < kRemainder; ++j) {
+                        vals[0][j] -= subQuantizerData[kRemainderBase + j];
+                        vals[1][j] -= subQuantizerData[kRemainderBase + j];
+                    }
+
+                    #pragma unroll
+                    for (int j = 0; j < kRemainder; ++j) {
+                        vals[0][j] *= vals[0][j];
+                        vals[1][j] *= vals[1][j];
+                    }
+                } else {
+                    // Inner product
+                    // Inner product: query slice against the reconstructed
+                    // sub-quantizer for this coarse cell (query o (centroid +
+                    // subQCentroid))
+                    #pragma unroll
+                    for (int j = 0; j < kRemainder; ++j) {
+                        vals[0][j] = smemResidual1[kRemainderBase + j];
+                        vals[1][j] = smemResidual1[DimsPerSubQuantizer + kRemainderBase + j];
+                    }
+
+                    #pragma unroll
+                    for (int j = 0; j < kRemainder; ++j) {
+                        vals[0][j] -= subQuantizerData[kRemainderBase + j];
+                        vals[1][j] -= subQuantizerData[kRemainderBase + j];
+                    }
+
+                    #pragma unroll
+                    for (int j = 0; j < kRemainder; ++j) {
+                        vals[0][j] *= smemQuery[kRemainderBase + j]; //获取平方
+                        vals[1][j] *= smemQuery[DimsPerSubQuantizer + kRemainderBase + j];
+                    }
+                }
+
+                #pragma unroll
+                for (int j = 0; j < kRemainder; ++j) {
+                    dist[0] += vals[0][j];
+                    dist[1] += vals[1][j];
+                }
+                // We have the distance for our code; write it out //写回 计算所有的查询向量在对应子向量上256个码本的得分与对应的nprobe有关，计算完成，后续直接得到得分
+                outCodeDistances[queryId[0]][coarse][subQuantizer][code] =
+                        ConvertTo<OutCodeT>::to(dist[0]);
+                outCodeDistances[queryId[1]][coarse][subQuantizer][code] =
+                        ConvertTo<OutCodeT>::to(dist[1]);
+            } // !isLoadingThread
+
+            // Swap residual buffers
+            float* tmp = smemResidual1;
+            smemResidual1 = smemResidual2;
+            smemResidual2 = tmp;
+        }
+    }
+
+    //这里是尾处理
+    //每个block都需要处理8个query最低，为了更好的数据复用 逐个处理，每个query的8个dim需要与256个线程对应的码本分别计算 这里能否一次处理多个？？？
+    for (int query = numQueries1; query < numQueries; ++query) {
+
+        //一个一个query处理，单次处理1个query
         auto queryId = startQueryId + query;
-
+        //对应的子向量 维度为8
         auto querySubQuantizer =
                 queries[queryId][subQuantizer * DimsPerSubQuantizer].data();
 
-        // Load current query vector
+        // Load current query vector 读取对应子向量的8个维度，根据任务划分确定当前的子向量 这里也就申请了8个空间，还是非常少的，读取的时候很浪费我们的线程带宽，明显可以申请更多lds读取更多数据
         for (int i = threadIdx.x; i < DimsPerSubQuantizer; i += blockDim.x) {
+            //多线程并行读取到lds上，但仅有8个数据，是的，这里只有8个数据
             smemQuery[i] = querySubQuantizer[i];
         }
 
@@ -114,8 +349,7 @@ __global__ void __launch_bounds__(LAUNCH_BOUND, 3) pqCodeDistances(
 
         // Preload first buffer of residual data
         if (isLoadingThread) {
-            for (int i = loadingThreadId; i < DimsPerSubQuantizer;
-                 i += blockDim.x - codesPerSubQuantizer) {
+            for (int i = loadingThreadId; i < DimsPerSubQuantizer; i += blockDim.x - codesPerSubQuantizer) {
                 auto coarseId = coarseIds[0];
                 // In case NaNs were in the original query data
                 coarseId = coarseId == -1 ? 0 : coarseId;
@@ -141,8 +375,7 @@ __global__ void __launch_bounds__(LAUNCH_BOUND, 3) pqCodeDistances(
 
             if (isLoadingThread) {
                 // Preload second buffer of residual data
-                for (int i = loadingThreadId; i < DimsPerSubQuantizer;
-                     i += blockDim.x - codesPerSubQuantizer) {
+                for (int i = loadingThreadId; i < DimsPerSubQuantizer; i += blockDim.x - codesPerSubQuantizer) {
                     // FIXME: try always making this centroid id 0 so we can
                     // terminate
                     if (coarse != (coarseIndices.getSize(1) - 1)) {
@@ -175,6 +408,7 @@ __global__ void __launch_bounds__(LAUNCH_BOUND, 3) pqCodeDistances(
                 constexpr int kRemainder = DimsPerSubQuantizer % kUnroll;
                 constexpr int kRemainderBase = DimsPerSubQuantizer - kRemainder;
                 float vals[kUnroll];
+                f32x4_vec<kUnroll> vals_v;
 
                 // Calculate residual - pqCentroid for each dim that we're
                 // processing
@@ -185,22 +419,17 @@ __global__ void __launch_bounds__(LAUNCH_BOUND, 3) pqCodeDistances(
                     for (int i = 0; i < DimsPerSubQuantizer / kUnroll; ++i) {
 #pragma unroll
                         for (int j = 0; j < kUnroll; ++j) {
-                            vals[j] = smemResidual1[i * kUnroll + j];
+                            vals_v.data[j] -= subQuantizerData[i * kUnroll + j]; //这是减去码本值
                         }
 
 #pragma unroll
                         for (int j = 0; j < kUnroll; ++j) {
-                            vals[j] -= subQuantizerData[i * kUnroll + j];
+                            vals_v.data[j] *= vals_v.data[j]; //获取平方
                         }
 
 #pragma unroll
                         for (int j = 0; j < kUnroll; ++j) {
-                            vals[j] *= vals[j];
-                        }
-
-#pragma unroll
-                        for (int j = 0; j < kUnroll; ++j) {
-                            dist += vals[j];
+                            dist += vals_v.data[j];
                         }
                     }
                 } else {
@@ -630,7 +859,7 @@ void runPQCodeDistances(
     // FIXME: tune
     // Reuse of pq centroid data is based on both # of queries * nprobe,
     // and we should really be tiling in both dimensions
-    constexpr int kQueriesPerBlock = 8;
+    constexpr int kQueriesPerBlock = 16;
 
     auto grid =
             dim3(utils::divUp(queries.getSize(0), kQueriesPerBlock),
@@ -642,8 +871,8 @@ void runPQCodeDistances(
     auto loadingThreads = utils::roundUp(dimsPerSubQuantizer, warpSize);
     auto block = dim3(codesPerSubQuantizer + loadingThreads);
 
-    auto smem = (3 * dimsPerSubQuantizer) * sizeof(float) +
-            coarseIndices.getSize(1) * sizeof(int);
+    auto smem =((3 * dimsPerSubQuantizer) * sizeof(float) +
+            coarseIndices.getSize(1) * sizeof(int))* 2;
 
 #define RUN_CODE(DIMS, L2)                                               \
     do {                                                                 \
