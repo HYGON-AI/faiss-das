@@ -5,9 +5,30 @@
 
 from __future__ import print_function
 from setuptools import setup, find_packages
+from setuptools.dist import Distribution
 import os
 import shutil
 import platform
+
+try:
+    from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+except ImportError:
+    _bdist_wheel = None
+
+
+class BinaryDistribution(Distribution):
+    def has_ext_modules(self):
+        return True
+
+
+if _bdist_wheel is not None:
+    class bdist_wheel(_bdist_wheel):
+        def finalize_options(self):
+            super().finalize_options()
+            self.root_is_pure = False
+else:
+    bdist_wheel = None
+
 
 # make the faiss python package dir
 shutil.rmtree("faiss", ignore_errors=True)
@@ -64,6 +85,14 @@ if found_swigfaiss_sve:
     shutil.copyfile("swigfaiss_sve.py", "faiss/swigfaiss_sve.py")
     shutil.copyfile(swigfaiss_sve_lib, f"faiss/_swigfaiss_sve{ext}")
 
+__version__ = "1.9.0"
+ROCM_PATH = os.getenv('ROCM_PATH', "/opt/dtk/")
+dtk_path = ROCM_PATH + '/.info/rocm_version'
+with open(dtk_path, 'r') as file:
+    content = file.read().strip()
+dtk_version = content.replace('.', '')
+hcu_version = __version__ + f'+das.opt1.dtk' + dtk_version
+
 long_description="""
 Faiss is a library for efficient similarity search and clustering of dense
 vectors. It contains algorithms that search in sets of vectors of any size,
@@ -74,7 +103,7 @@ are implemented on the GPU. It is developed by Facebook AI Research.
 """
 setup(
     name='faiss',
-    version='1.9.0',
+    version=hcu_version,
     description='A library for efficient similarity search and clustering of dense vectors',
     long_description=long_description,
     url='https://github.com/facebookresearch/faiss',
@@ -88,5 +117,7 @@ setup(
     package_data={
         'faiss': ['*.so', '*.pyd'],
     },
+    distclass=BinaryDistribution,
+    cmdclass={'bdist_wheel': bdist_wheel} if bdist_wheel is not None else {},
     zip_safe=False,
 )
