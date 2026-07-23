@@ -32,6 +32,7 @@ namespace gpu {
 // TVec: the potentially vectorized type we are loading in (e.g.,
 // float4, half2)
 template <typename T, typename TVec, int RowTileSize, bool NormSquared>
+__launch_bounds__(640)
 __global__ void l2NormRowMajor(
         Tensor<TVec, 2, true> input,
         Tensor<float, 1, true> output) {

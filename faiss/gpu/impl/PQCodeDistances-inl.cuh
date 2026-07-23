@@ -211,7 +211,7 @@ __global__ void __launch_bounds__(LAUNCH_BOUND, 3) pqCodeDistances(
                         vals_v.vec[1] = *(floatx4*)(smemResidual1 + DimsPerSubQuantizer + (i * kUnroll));
                         #pragma unroll
                         for (int j = 0; j < kUnroll; ++j) {
-                            vals_v.data[j] -= subQuantizerData[i * kUnroll + j]; //这是减去码本值
+                            vals_v.data[j] -= subQuantizerData[i * kUnroll + j];
                             vals_v.data[j + 4] -= subQuantizerData[i * kUnroll + j];
                         }
 
@@ -238,8 +238,8 @@ __global__ void __launch_bounds__(LAUNCH_BOUND, 3) pqCodeDistances(
                         vals_v.vec[1] = *(floatx4*)(smemResidual1 + DimsPerSubQuantizer + (i * kUnroll));
                         #pragma unroll
                         for (int j = 0; j < kUnroll; ++j) {
-                            vals_v.data[j] -= subQuantizerData[i * kUnroll + j]; //这是减去码本值
-                            vals_v.data[j + 4] -= subQuantizerData[i * kUnroll + j];
+                            vals_v.data[j] += subQuantizerData[i * kUnroll + j];
+                            vals_v.data[j + 4] += subQuantizerData[i * kUnroll + j];
                         }
 
                         #pragma unroll
@@ -288,13 +288,13 @@ __global__ void __launch_bounds__(LAUNCH_BOUND, 3) pqCodeDistances(
 
                     #pragma unroll
                     for (int j = 0; j < kRemainder; ++j) {
-                        vals[0][j] -= subQuantizerData[kRemainderBase + j];
-                        vals[1][j] -= subQuantizerData[kRemainderBase + j];
+                        vals[0][j] += subQuantizerData[kRemainderBase + j];
+                        vals[1][j] += subQuantizerData[kRemainderBase + j];
                     }
 
                     #pragma unroll
                     for (int j = 0; j < kRemainder; ++j) {
-                        vals[0][j] *= smemQuery[kRemainderBase + j]; //获取平方
+                        vals[0][j] *= smemQuery[kRemainderBase + j];
                         vals[1][j] *= smemQuery[DimsPerSubQuantizer + kRemainderBase + j];
                     }
                 }
@@ -417,9 +417,10 @@ __global__ void __launch_bounds__(LAUNCH_BOUND, 3) pqCodeDistances(
                 if (L2Distance) {
 #pragma unroll
                     for (int i = 0; i < DimsPerSubQuantizer / kUnroll; ++i) {
+                        vals_v.vec[0] = *(floatx4*)(smemResidual1 + (i * kUnroll));
 #pragma unroll
                         for (int j = 0; j < kUnroll; ++j) {
-                            vals_v.data[j] -= subQuantizerData[i * kUnroll + j]; //这是减去码本值
+                            vals_v.data[j] -= subQuantizerData[i * kUnroll + j];
                         }
 
 #pragma unroll
