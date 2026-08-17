@@ -4,7 +4,9 @@ This repository is based on the official Faiss project and contains
 Hygon-maintained modifications based on the official Faiss 1.9.0 release.
 
 - Upstream source: https://github.com/facebookresearch/faiss/tree/v1.9.0
+- Upstream commit: d243e628880676332263347817b3fe7f474b8b5b
 - Upstream documentation: https://faiss.ai/
+- Third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 
 Modified by Hygon Information Technology Co., Ltd.
 
