@@ -1,0 +1,21 @@
+name: Quality Gate
+
+on:
+  pull_request:
+    branches:
+      - 1.9.0
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: faiss-das-quality-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Checks
+    uses: HYGON-AI/quality-gate/.github/workflows/pr-quality-gate.yml@stable
+    permissions:
+      contents: read
