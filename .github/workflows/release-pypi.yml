@@ -1,0 +1,175 @@
+name: release-pypi
+
+on:
+  push:
+    branches:
+      - 1.9.0
+  # 手动触发只构建和生成 wheel，不上传 nightly。
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+
+env:
+  DTK_PKG_URL: ${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
+  PYPI_URL: ${{ vars.PYPI_URL }}
+  MAX_JOBS: "32"
+  CI_OUTPUT_DIR: /ci_public/faiss-das/${{ github.run_id }}
+
+jobs:
+  compile:
+    runs-on: bw1100
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: faiss
+    container:
+      image: ${{ vars.BASE_COMPILE_IMAGE_ROCKY_PY310 }}
+      options: >-
+        --device=/dev/kfd --device=/dev/dri --group-add video
+        -v /opt/hyhal:/opt/hyhal:ro
+        -v /ci_public:/ci_public
+        --shm-size=80G
+        --cap-add=SYS_PTRACE
+        --security-opt seccomp=unconfined
+        --privileged=true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: faiss
+
+      - name: Configure pip
+        shell: bash
+        env:
+          PYPI_INDEX: ${{ env.PYPI_URL }}/open/pypi/+simple/
+          DTK_INDEX: ${{ env.PYPI_URL }}/nightly/dtk2604/+simple/
+        run: |
+          set -euo pipefail
+          trusted_host="${PYPI_INDEX#*://}"
+          trusted_host="${trusted_host%%/*}"
+          trusted_host="${trusted_host%%:*}"
+          mkdir -p ~/.pip
+          printf '%s\n' \
+            '[global]' \
+            "index-url = ${PYPI_INDEX}" \
+            "extra-index-url = ${DTK_INDEX}" \
+            "trusted-host = ${trusted_host}" \
+            > ~/.pip/pip.conf
+
+      - name: Install DTK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /opt
+          wget -q "$DTK_PKG_URL"
+          tar -xzf "$(basename "$DTK_PKG_URL")"
+          rm -rf /opt/dtk
+          mv dtk-* dtk
+
+      - name: Install AICC
+        shell: bash
+        run: |
+          set -euo pipefail
+          wget "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh"
+          bash hcu_llvm_installer.sh --major 1.0.0
+        env:
+          RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          pip install --no-cache-dir \
+            numpy==1.26.4 swig ninja wheel setuptools packaging ciupload
+
+      - name: Build wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +u
+          source /opt/dtk/env.sh
+          set -u
+          bash faiss/gpu/hipify.sh
+          export LIBRARY_PATH="/opt/dtk/dcc/lib/clang/17.0.0/lib/linux:${LIBRARY_PATH:-}"
+          amd_comgr_config="$(find /opt/dtk/ -type f \
+            \( -name 'amd_comgr-config.cmake' -o -name 'amd_comgrConfig.cmake' \) \
+            -print -quit)"
+          [[ -n "${amd_comgr_config}" ]] || {
+            echo "amd_comgr CMake configuration was not found under /opt/dtk" >&2
+            exit 1
+          }
+          amd_comgr_dir="$(dirname "${amd_comgr_config}")"
+          export CMAKE_PREFIX_PATH="/opt/dtk:${amd_comgr_dir}:${CMAKE_PREFIX_PATH:-}"
+
+          mkl_library=""
+          for candidate in \
+            /usr/lib/x86_64-linux-gnu/libmkl_rt.so \
+            /opt/intel/compilers_and_libraries_2020.4.304/linux/mkl/lib/intel64_lin/libmkl_rt.so; do
+            if [[ -f "${candidate}" ]]; then
+              mkl_library="${candidate}"
+              break
+            fi
+          done
+          if [[ -z "${mkl_library}" ]]; then
+            mkl_library="$(find "${MKLROOT:-/opt/intel}" -type f -name libmkl_rt.so -print -quit 2>/dev/null || true)"
+          fi
+          [[ -n "${mkl_library}" ]] || { echo "libmkl_rt.so was not found" >&2; exit 1; }
+          CC=hipcc CXX=hipcc cmake -S . -B build \
+            -DFAISS_ENABLE_GPU=ON \
+            -DFAISS_ENABLE_ROCM=ON \
+            -DFAISS_OPT_LEVEL=avx \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/build/install" \
+            -Damd_comgr_DIR="${amd_comgr_dir}" \
+            -DMKL_LIBRARIES="${mkl_library}"
+          cmake --build build --parallel "${MAX_JOBS}"
+          cmake --install build
+          cd build/faiss/python
+          python3 setup.py bdist_wheel
+
+      - name: Apply DAS local version to wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --no-cache-dir --no-deps build/faiss/python/dist/*.whl
+          bash .github/scripts/manylinux_repair.sh \
+            build/faiss/python/dist dist-manylinux build/faiss
+          dtk_version="$(tr -d '.[:space:]' < /opt/dtk/.info/rocm_version)"
+          CIUpload REPAIR \
+            --dtk_version "${dtk_version}" \
+            --git_commit "$(git rev-parse HEAD)" \
+            --outputdir output \
+            -f dist-manylinux/*.whl
+
+      - name: Save wheel on host
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${CI_OUTPUT_DIR}"
+          cp -v output/*.whl "${CI_OUTPUT_DIR}/"
+          echo "wheel saved to ${CI_OUTPUT_DIR}"
+
+      - name: Upload NIGHTLY package
+        if: ${{ github.event_name == 'push' }}
+        env:
+          # CIUpload uses this token to read GitHub metadata for DashHub.
+          GITHUB_TOKEN: ${{ github.token }}
+          PYPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CIUpload NIGHTLY \
+            --devpi_url "${PYPI_URL}" \
+            --password "${PYPI_PASSWORD}" \
+            --dtk_pkg_name "$(basename "$DTK_PKG_URL")" \
+            --record \
+            -f output/*.whl
+
+      - name: Clean workspace
+        if: always()
+        shell: bash
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
