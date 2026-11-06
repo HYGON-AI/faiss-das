@@ -21,14 +21,22 @@ template <typename T>
 struct GetCudaType;
 
 #ifdef USE_AMD_ROCM
+
+#if ((hipblasVersionMajor == 2 && defined(HIPBLAS_V2)) || \
+     hipblasVersionMajor >= 3)
+using hipDataTypeCompat = hipDataType;
+#else
+using hipDataTypeCompat = hipblasDatatype_t;
+#endif
+
 template <>
 struct GetCudaType<float> {
-    static constexpr hipblasDatatype_t Type = HIPBLAS_R_32F;
+    static constexpr hipDataTypeCompat Type = HIPBLAS_R_32F;
 };
 
 template <>
 struct GetCudaType<half> {
-    static constexpr hipblasDatatype_t Type = HIPBLAS_R_16F;
+    static constexpr hipDataTypeCompat Type = HIPBLAS_R_16F;
 };
 #else
 template <>
@@ -62,6 +70,13 @@ cublasStatus_t rawGemm(
     auto cBT = GetCudaType<BT>::Type;
 
 #ifdef USE_AMD_ROCM
+#if ((hipblasVersionMajor == 2 && defined(HIPBLAS_V2)) || \
+     hipblasVersionMajor >= 3)
+    auto computeType = HIPBLAS_COMPUTE_32F;
+#else
+    auto computeType = HIPBLAS_R_32F;
+#endif
+
     return hipblasGemmEx(
             handle,
             transa,
@@ -80,7 +95,7 @@ cublasStatus_t rawGemm(
             C,
             HIPBLAS_R_32F,
             ldc,
-            HIPBLAS_R_32F,
+            computeType,
             HIPBLAS_GEMM_DEFAULT);
 #else
 
@@ -163,6 +178,13 @@ cublasStatus_t rawBatchGemm(
 
     // Always accumulate in f32
 #ifdef USE_AMD_ROCM
+#if ((hipblasVersionMajor == 2 && defined(HIPBLAS_V2)) || \
+     hipblasVersionMajor >= 3)
+    auto computeType = HIPBLAS_COMPUTE_32F;
+#else
+    auto computeType = HIPBLAS_R_32F;
+#endif
+
     return hipblasGemmStridedBatchedEx(
             handle,
             transa,
@@ -185,7 +207,7 @@ cublasStatus_t rawBatchGemm(
             ldc,
             strideC,
             batchCount,
-            HIPBLAS_R_32F,
+            computeType,
             HIPBLAS_GEMM_DEFAULT);
 #else
     return cublasGemmStridedBatchedEx(
