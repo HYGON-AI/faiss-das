@@ -4,137 +4,43 @@ on:
   pull_request_target:
     branches:
       - 1.9.0
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
 
 concurrency:
   group: faiss-das-pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: >-
-    ${{
-      (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-      github.event.label.name == 'ready-hcu'
-    }}
+  cancel-in-progress: true
 
 env:
-  DTK_PKG_URL: ${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
   PYPI_URL: ${{ vars.PYPI_URL }}
   MAX_JOBS: "32"
-  CI_OUTPUT_DIR: /ci_public/faiss-das/${{ github.run_id }}
 
 jobs:
-  authorize-pr:
-    name: Authorize HCU execution
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: write
-    outputs:
-      authorized: ${{ steps.authorization.outputs.authorized }}
-    steps:
-      - name: Verify ready-hcu authorization
-        id: authorization
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const label = "ready-hcu";
-            const action = context.payload.action;
-            const pullRequest = context.payload.pull_request;
-            const labels = pullRequest.labels.map(item => item.name);
-
-            core.setOutput("authorized", "false");
-
-            if ((action === "labeled" || action === "unlabeled") &&
-                context.payload.label?.name !== label) {
-              if (!labels.includes(label)) {
-                core.setFailed(
-                  `HCU CI is locked for ${pullRequest.head.sha}. ` +
-                  `A trusted maintainer must apply the ${label} label.`
-                );
-                return;
-              }
-              core.info(`Ignoring unrelated label: ${context.payload.label?.name}.`);
-              return;
-            }
-
-            if (action === "unlabeled") {
-              core.setFailed(
-                `HCU CI authorization was revoked for PR #${pullRequest.number}. ` +
-                `A trusted maintainer must apply the ${label} label.`
-              );
-              return;
-            }
-
-            if (action !== "labeled") {
-              if (labels.includes(label)) {
-                core.info(
-                  `PR #${pullRequest.number} remains authorized for ${pullRequest.head.sha}.`
-                );
-                core.setOutput("authorized", "true");
-                return;
-              }
-              core.setFailed(
-                `HCU CI is locked for ${pullRequest.head.sha}. ` +
-                `A trusted maintainer must apply the ${label} label.`
-              );
-              return;
-            }
-
-            const response = await github.rest.repos.getCollaboratorPermissionLevel({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              username: context.actor,
-            });
-            const permission = response.data.permission;
-            const trusted = new Set(["write", "maintain", "admin"]);
-            if (!trusted.has(permission)) {
-              try {
-                await github.rest.issues.removeLabel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: pullRequest.number,
-                  name: label,
-                });
-              } catch (error) {
-                if (error.status !== 404) {
-                  throw error;
-                }
-              }
-              core.setFailed(
-                `${context.actor} cannot authorize HCU CI (permission: ${permission}).`
-              );
-              return;
-            }
-
-            core.info(
-              `${context.actor} authorized HCU CI for ${pullRequest.head.sha}.`
-            );
-            core.setOutput("authorized", "true");
-
   compile:
-    name: Build and Test Faiss DAS
-    needs: authorize-pr
-    if: >-
-      ${{
-        needs.authorize-pr.result == 'success' &&
-        needs.authorize-pr.outputs.authorized == 'true'
-      }}
-    runs-on: bw1100
+    name: Build Faiss DAS (${{ matrix.dtk }})
+    runs-on: hygon-build
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dtk: dtk2604
+            image: hcu/base/dtk:26.04-rockylinux8.6-py3.10
+            dtk_index: nightly/dtk2604/+simple/
+            aicc_major: 1.0.0
+          - dtk: dtk2610
+            image: hcu/base/dtk:26.10-rockylinux8.6-py3.12
+            dtk_index: nightly/dtk2610/+simple/
+            aicc_major: 2.0.0
+    env:
+      ARTIFACT_DIR: /ci_public/faiss-das/runs/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.dtk }}
     defaults:
       run:
         working-directory: faiss
     container:
-      image: ${{ vars.BASE_COMPILE_IMAGE_ROCKY_PY310 }}
-      options: >-
-        --device=/dev/kfd --device=/dev/dri --group-add video
-        -v /opt/hyhal:/opt/hyhal:ro
-        -v /ci_public:/ci_public
-        --shm-size=80G
-        --cap-add=SYS_PTRACE
-        --security-opt seccomp=unconfined
-        --privileged=true
+      image: ${{ vars.HARBOR_SITE }}/${{ matrix.image }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -159,7 +65,7 @@ jobs:
         shell: bash
         env:
           PYPI_INDEX: ${{ env.PYPI_URL }}/open/pypi/+simple/
-          DTK_INDEX: ${{ env.PYPI_URL }}/nightly/dtk2604/+simple/
+          DTK_INDEX: ${{ env.PYPI_URL }}/${{ matrix.dtk_index }}
         run: |
           set -euo pipefail
           trusted_host="${PYPI_INDEX#*://}"
@@ -170,25 +76,31 @@ jobs:
             "extra-index-url = ${DTK_INDEX}" \
             "trusted-host = ${trusted_host}" > ~/.pip/pip.conf
 
-      - name: Install DTK and build dependencies
+      - name: Verify DTK and install build dependencies
         shell: bash
         run: |
           set -euo pipefail
-          cd /opt
-          wget -q "$DTK_PKG_URL"
-          tar -xzf "$(basename "$DTK_PKG_URL")"
-          rm -rf /opt/dtk
-          mv dtk-* dtk
-          pip install --no-cache-dir numpy==1.26.4 swig ninja wheel setuptools packaging
+          test -f /opt/dtk/env.sh
+          set +u
+          source /opt/dtk/env.sh
+          set -u
+          hipcc --version
+          pip install --no-cache-dir numpy==1.26.4 swig ninja wheel setuptools packaging ciupload
 
       - name: Install AICC
         shell: bash
+        env:
+          AICC_MAJOR: ${{ matrix.aicc_major }}
+          DTK_VARIANT: ${{ matrix.dtk }}
+          RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
         run: |
           set -euo pipefail
           wget "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh"
-          bash hcu_llvm_installer.sh --major 1.0.0
-        env:
-          RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
+          if [[ "${DTK_VARIANT}" == "dtk2610" ]]; then
+            bash hcu_llvm_installer.sh --major "${AICC_MAJOR}" --dtk-dir /opt/dtk
+          else
+            bash hcu_llvm_installer.sh --major "${AICC_MAJOR}"
+          fi
 
       - name: Build wheel
         shell: bash
@@ -198,7 +110,9 @@ jobs:
           source /opt/dtk/env.sh
           set -u
           bash faiss/gpu/hipify.sh
-          export LIBRARY_PATH="/opt/dtk/dcc/lib/clang/17.0.0/lib/linux:${LIBRARY_PATH:-}"
+          clang_runtime_dir="$(find /opt/dtk/dcc/lib/clang -type d -path '*/lib/linux' -print -quit 2>/dev/null || true)"
+          [[ -n "${clang_runtime_dir}" ]] || { echo "Clang runtime directory was not found" >&2; exit 1; }
+          export LIBRARY_PATH="${clang_runtime_dir}:${LIBRARY_PATH:-}"
           amd_comgr_config="$(find /opt/dtk/ -type f \
             \( -name 'amd_comgr-config.cmake' -o -name 'amd_comgrConfig.cmake' \) \
             -print -quit)"
@@ -236,8 +150,6 @@ jobs:
           cmake --install build
           cd build/faiss/python
           python3 setup.py bdist_wheel
-          python3 -m pip install --force-reinstall --no-deps dist/*.whl
-          python3 -c "import faiss; print(faiss.__version__)"
 
       - name: Build manylinux wheel
         shell: bash
@@ -245,28 +157,6 @@ jobs:
           set -euo pipefail
           bash .github/scripts/manylinux_repair.sh \
             build/faiss/python/dist build/dist-manylinux build/faiss
-
-      - name: Install and verify manylinux wheel
-        shell: bash
-        run: |
-          set -euo pipefail
-          set +u
-          source /opt/dtk/env.sh
-          set -u
-          python3 -m pip install --no-cache-dir numpy==1.26.4 ciupload
-          python3 -m pip install --force-reinstall --no-deps build/dist-manylinux/*.whl
-          python3 -c "import faiss; print(f'tested manylinux wheel: faiss={faiss.__version__}')"
-
-      - name: Run C++ tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          set +u
-          source /opt/dtk/env.sh
-          set -u
-          export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/faiss/build/faiss:${LD_LIBRARY_PATH:-}"
-          # build.md requires running CTest from the build directory.
-          ctest --test-dir build --output-on-failure
 
       - name: Apply DAS local version to wheel
         shell: bash
@@ -281,13 +171,120 @@ jobs:
             --outputdir output \
             -f build/dist-manylinux/*.whl
 
-      - name: Save manylinux wheel on host
+      - name: Save build outputs for tests
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "${CI_OUTPUT_DIR}"
-          cp -v output/*.whl "${CI_OUTPUT_DIR}/"
-          echo "wheel saved to ${CI_OUTPUT_DIR}"
+          rm -rf "${ARTIFACT_DIR}"
+          mkdir -p "${ARTIFACT_DIR}"
+          cp -v output/*.whl "${ARTIFACT_DIR}/"
+          tar -czf "${ARTIFACT_DIR}/build.tar.gz" build
+
+      - name: Clean workspace
+        if: always()
+        shell: bash
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
+
+  test:
+    name: Test Faiss DAS (${{ matrix.dtk }}, 1 card)
+    needs: compile
+    if: ${{ always() && needs.compile.result != 'cancelled' }}
+    runs-on: hygon-bw1100-1card
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dtk: dtk2604
+            image: hcu/base/dtk:26.04-rockylinux8.6-py3.10
+            dtk_index: nightly/dtk2604/+simple/
+          - dtk: dtk2610
+            image: hcu/base/dtk:26.10-rockylinux8.6-py3.12
+            dtk_index: nightly/dtk2610/+simple/
+    env:
+      ARTIFACT_DIR: /ci_public/faiss-das/runs/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.dtk }}
+    defaults:
+      run:
+        working-directory: faiss
+    container:
+      image: ${{ vars.HARBOR_SITE }}/${{ matrix.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: faiss
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: Merge PR revision locally
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "${PR_BASE_SHA}" "${PR_HEAD_SHA}"
+          git checkout --detach "${PR_BASE_SHA}"
+          git -c user.name=github-actions -c user.email=ci@github \
+            merge --no-ff --no-edit "${PR_HEAD_SHA}"
+
+      - name: Configure pip
+        shell: bash
+        env:
+          PYPI_INDEX: ${{ env.PYPI_URL }}/open/pypi/+simple/
+          DTK_INDEX: ${{ env.PYPI_URL }}/${{ matrix.dtk_index }}
+        run: |
+          set -euo pipefail
+          trusted_host="${PYPI_INDEX#*://}"
+          trusted_host="${trusted_host%%/*}"
+          trusted_host="${trusted_host%%:*}"
+          mkdir -p ~/.pip
+          printf '%s\n' '[global]' "index-url = ${PYPI_INDEX}" \
+            "extra-index-url = ${DTK_INDEX}" \
+            "trusted-host = ${trusted_host}" > ~/.pip/pip.conf
+
+      - name: Restore build outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "${ARTIFACT_DIR}/build.tar.gz"
+          tar -xzf "${ARTIFACT_DIR}/build.tar.gz"
+          shopt -s nullglob
+          wheels=("${ARTIFACT_DIR}"/*.whl)
+          shopt -u nullglob
+          [[ "${#wheels[@]}" -eq 1 ]] || {
+            echo "expected one wheel in ${ARTIFACT_DIR}, found ${#wheels[@]}" >&2
+            exit 1
+          }
+          echo "WHEEL_PATH=${wheels[0]}" >> "${GITHUB_ENV}"
+
+      - name: Install and verify manylinux wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f /opt/dtk/env.sh
+          set +u
+          source /opt/dtk/env.sh
+          set -u
+          python3 -m pip install --no-cache-dir numpy==1.26.4
+          python3 -m pip install --force-reinstall --no-deps "${WHEEL_PATH}"
+          python3 -c "import faiss; print(f'tested manylinux wheel: faiss={faiss.__version__}')"
+
+      - name: Run C++ tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +u
+          source /opt/dtk/env.sh
+          set -u
+          export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/faiss/build/faiss:${LD_LIBRARY_PATH:-}"
+          # build.md requires running CTest from the build directory.
+          ctest --test-dir build --output-on-failure
+
+      - name: Clean shared outputs
+        if: always()
+        shell: bash
+        run: rm -rf "${ARTIFACT_DIR}" || true
 
       - name: Clean workspace
         if: always()
