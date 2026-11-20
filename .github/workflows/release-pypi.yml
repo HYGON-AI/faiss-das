@@ -26,15 +26,23 @@ jobs:
       matrix:
         include:
           - dtk: dtk2604
+            dtk_version: "2604"
             image: hcu/base/dtk:26.04-rockylinux8.6-py3.10
             dtk_index: nightly/dtk2604/+simple/
-            dtk_pkg_name: DTK-26.04-rc4-centos8-x86_64.tar.gz
             aicc_major: 1.0.0
+            torch_version: ""
           - dtk: dtk2610
+            dtk_version: "2610"
             image: hcu/base/dtk:26.10-rockylinux8.6-py3.12
             dtk_index: nightly/dtk2610/+simple/
-            dtk_pkg_name: DTK-26.10-CentOS8.5-x86_64.tar.gz
             aicc_major: 2.0.0
+            torch_version: ""
+          - dtk: dtk2704-torch213
+            dtk_version: "2704"
+            image: hcu/base/dtk:27.04-rockylinux8.6-py3.12
+            dtk_index: nightly/dtk2704/+simple/
+            aicc_major: 2.0.0
+            torch_version: "2.13.0"
     defaults:
       run:
         working-directory: faiss
@@ -83,7 +91,7 @@ jobs:
         run: |
           set -euo pipefail
           wget "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh"
-          if [[ "${DTK_VARIANT}" == "dtk2610" ]]; then
+          if [[ "${DTK_VARIANT}" == "dtk2610" || "${DTK_VARIANT}" == "dtk2704-torch213" ]]; then
             bash hcu_llvm_installer.sh --major "${AICC_MAJOR}" --dtk-dir /opt/dtk
           else
             bash hcu_llvm_installer.sh --major "${AICC_MAJOR}"
@@ -91,9 +99,22 @@ jobs:
 
       - name: Install build dependencies
         shell: bash
+        env:
+          DTK_INDEX: ${{ env.PYPI_URL }}/${{ matrix.dtk_index }}
+          TORCH_VERSION: ${{ matrix.torch_version }}
         run: |
+          set -euo pipefail
           pip install --no-cache-dir \
             numpy==1.26.4 swig ninja wheel setuptools packaging ciupload
+          if [[ -n "${TORCH_VERSION}" ]]; then
+            trusted_host="${DTK_INDEX#*://}"
+            trusted_host="${trusted_host%%/*}"
+            trusted_host="${trusted_host%%:*}"
+            python3 -m pip install --no-cache-dir \
+              --index-url "${DTK_INDEX}" --trusted-host "${trusted_host}" \
+              "torch==${TORCH_VERSION}"
+            python3 -c "import torch; print(f'torch={torch.__version__}')"
+          fi
 
       - name: Build wheel
         shell: bash
@@ -146,17 +167,23 @@ jobs:
 
       - name: Apply DAS local version to wheel
         shell: bash
+        env:
+          DTK_VERSION: ${{ matrix.dtk_version }}
+          TORCH_VERSION: ${{ matrix.torch_version }}
         run: |
           set -euo pipefail
           python3 -m pip install --no-cache-dir --no-deps build/faiss/python/dist/*.whl
           bash .github/scripts/manylinux_repair.sh \
             build/faiss/python/dist dist-manylinux build/faiss
-          dtk_version="$(tr -d '.[:space:]' < /opt/dtk/.info/rocm_version)"
-          CIUpload REPAIR \
-            --dtk_version "${dtk_version}" \
-            --git_commit "$(git rev-parse HEAD)" \
-            --outputdir output \
-            -f dist-manylinux/*.whl
+          repair_args=(
+            --dtk_version "${DTK_VERSION}"
+            --git_commit "$(git rev-parse --short=6 HEAD)"
+            --outputdir output
+          )
+          if [[ -n "${TORCH_VERSION}" ]]; then
+            repair_args+=(--torch_version "${TORCH_VERSION}")
+          fi
+          CIUpload REPAIR "${repair_args[@]}" -f dist-manylinux/*.whl
 
       - name: Upload NIGHTLY package
         if: ${{ github.event_name == 'push' }}
@@ -164,14 +191,14 @@ jobs:
           # CIUpload uses this token to read GitHub metadata for DashHub.
           GITHUB_TOKEN: ${{ github.token }}
           PYPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
-          DTK_PKG_NAME: ${{ matrix.dtk_pkg_name }}
+          DTK_VERSION: ${{ matrix.dtk_version }}
         shell: bash
         run: |
           set -euo pipefail
           CIUpload NIGHTLY \
             --devpi_url "${PYPI_URL}" \
+            --dtk_version "${DTK_VERSION}" \
             --password "${PYPI_PASSWORD}" \
-            --dtk_pkg_name "${DTK_PKG_NAME}" \
             --record \
             -f output/*.whl
 
