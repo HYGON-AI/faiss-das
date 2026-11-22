@@ -123,6 +123,8 @@ jobs:
           set +u
           source /opt/dtk/env.sh
           set -u
+          : "${AMDGPU_TARGETS:?ERROR: DTK env.sh did not set AMDGPU_TARGETS}"
+          echo "Building for GPU targets: ${AMDGPU_TARGETS}"
           bash faiss/gpu/hipify.sh
           clang_runtime_dir="$(find /opt/dtk/dcc/lib/clang -type d -path '*/lib/linux' -print -quit 2>/dev/null || true)"
           [[ -n "${clang_runtime_dir}" ]] || { echo "Clang runtime directory was not found" >&2; exit 1; }
@@ -159,7 +161,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/build/install" \
             -Damd_comgr_DIR="${amd_comgr_dir}" \
-            -DMKL_LIBRARIES="${mkl_library}"
+            -DMKL_LIBRARIES="${mkl_library}" \
+            -DCMAKE_HIP_ARCHITECTURES="${AMDGPU_TARGETS}"
           cmake --build build --parallel "${MAX_JOBS}"
           cmake --install build
           cd build/faiss/python
