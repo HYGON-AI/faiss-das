@@ -127,21 +127,15 @@ jobs:
           - dtk: dtk2604
             dtk_version: "2604"
             image: hcu/base/dtk:26.04-rockylinux8.6-py3.10
-            dtk_index: nightly/dtk2604/+simple/
             aicc_major: 1.0.0
-            torch_version: ""
           - dtk: dtk2610
             dtk_version: "2610"
             image: hcu/base/dtk:26.10-rockylinux8.6-py3.12
-            dtk_index: nightly/dtk2610/+simple/
             aicc_major: 2.0.0
-            torch_version: ""
-          - dtk: dtk2704-torch213
+          - dtk: dtk2704
             dtk_version: "2704"
             image: hcu/base/dtk:27.04-rockylinux8.6-py3.12
-            dtk_index: nightly/dtk2704/+simple/
             aicc_major: 2.0.0
-            torch_version: "2.13.0"
     env:
       ARTIFACT_DIR: /ci_public/faiss-das/runs/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.dtk }}
     defaults:
@@ -186,9 +180,6 @@ jobs:
 
       - name: Verify DTK and install build dependencies
         shell: bash
-        env:
-          DTK_INDEX: ${{ env.PYPI_URL }}/${{ matrix.dtk_index }}
-          TORCH_VERSION: ${{ matrix.torch_version }}
         run: |
           set -euo pipefail
           test -f /opt/dtk/env.sh
@@ -197,15 +188,6 @@ jobs:
           set -u
           hipcc --version
           pip install --no-cache-dir numpy==1.26.4 swig ninja wheel setuptools packaging ciupload
-          if [[ -n "${TORCH_VERSION}" ]]; then
-            trusted_host="${DTK_INDEX#*://}"
-            trusted_host="${trusted_host%%/*}"
-            trusted_host="${trusted_host%%:*}"
-            python3 -m pip install --no-cache-dir \
-              --index-url "${DTK_INDEX}" --trusted-host "${trusted_host}" \
-              "torch==${TORCH_VERSION}"
-            python3 -c "import torch; print(f'torch={torch.__version__}')"
-          fi
 
       - name: Install AICC
         shell: bash
@@ -285,7 +267,6 @@ jobs:
         shell: bash
         env:
           DTK_VERSION: ${{ matrix.dtk_version }}
-          TORCH_VERSION: ${{ matrix.torch_version }}
           GIT_COMMIT: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
@@ -294,9 +275,6 @@ jobs:
             --git_commit "${GIT_COMMIT:0:6}"
             --outputdir output
           )
-          if [[ -n "${TORCH_VERSION}" ]]; then
-            repair_args+=(--torch_version "${TORCH_VERSION}")
-          fi
           CIUpload REPAIR "${repair_args[@]}" -f build/dist-manylinux/*.whl
 
       - name: Save build outputs for tests
@@ -326,18 +304,12 @@ jobs:
           - dtk: dtk2604
             dtk_version: "2604"
             image: hcu/base/dtk:26.04-rockylinux8.6-py3.10
-            dtk_index: nightly/dtk2604/+simple/
-            torch_version: ""
           - dtk: dtk2610
             dtk_version: "2610"
             image: hcu/base/dtk:26.10-rockylinux8.6-py3.12
-            dtk_index: nightly/dtk2610/+simple/
-            torch_version: ""
-          - dtk: dtk2704-torch213
+          - dtk: dtk2704
             dtk_version: "2704"
             image: hcu/base/dtk:27.04-rockylinux8.6-py3.12
-            dtk_index: nightly/dtk2704/+simple/
-            torch_version: "2.13.0"
     env:
       ARTIFACT_DIR: /ci_public/faiss-das/runs/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.dtk }}
     defaults:
@@ -397,9 +369,6 @@ jobs:
 
       - name: Install and verify manylinux wheel
         shell: bash
-        env:
-          DTK_INDEX: ${{ env.PYPI_URL }}/${{ matrix.dtk_index }}
-          TORCH_VERSION: ${{ matrix.torch_version }}
         run: |
           set -euo pipefail
           test -f /opt/dtk/env.sh
@@ -407,16 +376,6 @@ jobs:
           source /opt/dtk/env.sh
           set -u
           python3 -m pip install --no-cache-dir numpy==1.26.4
-          if [[ -n "${TORCH_VERSION}" ]]; then
-            trusted_host="${DTK_INDEX#*://}"
-            trusted_host="${trusted_host%%/*}"
-            trusted_host="${trusted_host%%:*}"
-            python3 -m pip install --no-cache-dir \
-              --index-url "${DTK_INDEX}" --trusted-host "${trusted_host}" \
-              "torch==${TORCH_VERSION}"
-            EXPECTED_TORCH_VERSION="${TORCH_VERSION}" python3 -c \
-              "import os, torch; assert torch.__version__.split('+', 1)[0] == os.environ['EXPECTED_TORCH_VERSION'], torch.__version__"
-          fi
           python3 -m pip install --force-reinstall --no-deps "${WHEEL_PATH}"
           python3 -c "import faiss; print(f'tested manylinux wheel: faiss={faiss.__version__}')"
 
