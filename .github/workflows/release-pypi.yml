@@ -26,14 +26,16 @@ jobs:
       matrix:
         include:
           - dtk: dtk2604
+            dtk_version: "2604"
             image: hcu/base/dtk:26.04-rockylinux8.6-py3.10
-            dtk_index: nightly/dtk2604/+simple/
-            dtk_pkg_name: DTK-26.04-rc4-centos8-x86_64.tar.gz
             aicc_major: 1.0.0
           - dtk: dtk2610
+            dtk_version: "2610"
             image: hcu/base/dtk:26.10-rockylinux8.6-py3.12
-            dtk_index: nightly/dtk2610/+simple/
-            dtk_pkg_name: DTK-26.10-CentOS8.5-x86_64.tar.gz
+            aicc_major: 2.0.0
+          - dtk: dtk2704
+            dtk_version: "2704"
+            image: hcu/base/dtk:27.04-rockylinux8.6-py3.12
             aicc_major: 2.0.0
     defaults:
       run:
@@ -83,7 +85,7 @@ jobs:
         run: |
           set -euo pipefail
           wget "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh"
-          if [[ "${DTK_VARIANT}" == "dtk2610" ]]; then
+          if [[ "${DTK_VARIANT}" == "dtk2610" || "${DTK_VARIANT}" == "dtk2704-torch213" ]]; then
             bash hcu_llvm_installer.sh --major "${AICC_MAJOR}" --dtk-dir /opt/dtk
           else
             bash hcu_llvm_installer.sh --major "${AICC_MAJOR}"
@@ -92,6 +94,7 @@ jobs:
       - name: Install build dependencies
         shell: bash
         run: |
+          set -euo pipefail
           pip install --no-cache-dir \
             numpy==1.26.4 swig ninja wheel setuptools packaging ciupload
 
@@ -102,6 +105,8 @@ jobs:
           set +u
           source /opt/dtk/env.sh
           set -u
+          : "${AMDGPU_TARGETS:?ERROR: DTK env.sh did not set AMDGPU_TARGETS}"
+          echo "Building for GPU targets: ${AMDGPU_TARGETS}"
           bash faiss/gpu/hipify.sh
           clang_runtime_dir="$(find /opt/dtk/dcc/lib/clang -type d -path '*/lib/linux' -print -quit 2>/dev/null || true)"
           [[ -n "${clang_runtime_dir}" ]] || { echo "Clang runtime directory was not found" >&2; exit 1; }
@@ -138,7 +143,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/build/install" \
             -Damd_comgr_DIR="${amd_comgr_dir}" \
-            -DMKL_LIBRARIES="${mkl_library}"
+            -DMKL_LIBRARIES="${mkl_library}" \
+            -DCMAKE_HIP_ARCHITECTURES="${AMDGPU_TARGETS}"
           cmake --build build --parallel "${MAX_JOBS}"
           cmake --install build
           cd build/faiss/python
@@ -146,17 +152,19 @@ jobs:
 
       - name: Apply DAS local version to wheel
         shell: bash
+        env:
+          DTK_VERSION: ${{ matrix.dtk_version }}
         run: |
           set -euo pipefail
           python3 -m pip install --no-cache-dir --no-deps build/faiss/python/dist/*.whl
           bash .github/scripts/manylinux_repair.sh \
             build/faiss/python/dist dist-manylinux build/faiss
-          dtk_version="$(tr -d '.[:space:]' < /opt/dtk/.info/rocm_version)"
-          CIUpload REPAIR \
-            --dtk_version "${dtk_version}" \
-            --git_commit "$(git rev-parse HEAD)" \
-            --outputdir output \
-            -f dist-manylinux/*.whl
+          repair_args=(
+            --dtk_version "${DTK_VERSION}"
+            --git_commit "$(git rev-parse --short=6 HEAD)"
+            --outputdir output
+          )
+          CIUpload REPAIR "${repair_args[@]}" -f dist-manylinux/*.whl
 
       - name: Upload NIGHTLY package
         if: ${{ github.event_name == 'push' }}
@@ -164,14 +172,14 @@ jobs:
           # CIUpload uses this token to read GitHub metadata for DashHub.
           GITHUB_TOKEN: ${{ github.token }}
           PYPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
-          DTK_PKG_NAME: ${{ matrix.dtk_pkg_name }}
+          DTK_VERSION: ${{ matrix.dtk_version }}
         shell: bash
         run: |
           set -euo pipefail
           CIUpload NIGHTLY \
             --devpi_url "${PYPI_URL}" \
+            --dtk_version "${DTK_VERSION}" \
             --password "${PYPI_PASSWORD}" \
-            --dtk_pkg_name "${DTK_PKG_NAME}" \
             --record \
             -f output/*.whl
 

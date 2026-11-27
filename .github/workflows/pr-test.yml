@@ -4,22 +4,134 @@ on:
   pull_request_target:
     branches:
       - 1.9.0
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
 permissions:
   contents: read
 
 concurrency:
   group: faiss-das-pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: >-
+    ${{
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      github.event.label.name == 'ready-hcu'
+    }}
 
 env:
   PYPI_URL: ${{ vars.PYPI_URL }}
   MAX_JOBS: "32"
 
 jobs:
+  authorize-pr:
+    name: Authorize HCU execution
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      authorized: ${{ steps.authorization.outputs.authorized }}
+    steps:
+      - name: Verify ready-hcu authorization
+        id: authorization
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = "ready-hcu";
+            const action = context.payload.action;
+            const pullRequest = context.payload.pull_request;
+            const labels = pullRequest.labels.map(item => item.name);
+
+            core.setOutput("authorized", "false");
+
+            if (action === "synchronize" && labels.includes(label)) {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pullRequest.number,
+                name: label,
+              });
+              core.setFailed(
+                `PR #${pullRequest.number} was updated to ${pullRequest.head.sha}. ` +
+                `The ${label} label was removed; a trusted maintainer must apply it again.`
+              );
+              return;
+            }
+
+            if ((action === "labeled" || action === "unlabeled") &&
+                context.payload.label?.name !== label) {
+              if (!labels.includes(label)) {
+                core.setFailed(
+                  `HCU CI is locked for ${pullRequest.head.sha}. ` +
+                  `A trusted maintainer must apply the ${label} label.`
+                );
+                return;
+              }
+              core.info(`Ignoring unrelated label: ${context.payload.label?.name}.`);
+              return;
+            }
+
+            if (action === "unlabeled") {
+              core.setFailed(
+                `HCU CI authorization was revoked for PR #${pullRequest.number}. ` +
+                `A trusted maintainer must apply the ${label} label.`
+              );
+              return;
+            }
+
+            if (action !== "labeled") {
+              if (labels.includes(label)) {
+                core.info(
+                  `PR #${pullRequest.number} remains authorized for ${pullRequest.head.sha}.`
+                );
+                core.setOutput("authorized", "true");
+                return;
+              }
+              core.setFailed(
+                `HCU CI is locked for ${pullRequest.head.sha}. ` +
+                `A trusted maintainer must apply the ${label} label.`
+              );
+              return;
+            }
+
+            const response = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.actor,
+            });
+            const permission = response.data.permission;
+            const trusted = new Set(["write", "maintain", "admin"]);
+            if (!trusted.has(permission)) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pullRequest.number,
+                  name: label,
+                });
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+              }
+              core.setFailed(
+                `${context.actor} cannot authorize HCU CI (permission: ${permission}).`
+              );
+              return;
+            }
+
+            core.info(
+              `${context.actor} authorized HCU CI for ${pullRequest.head.sha}.`
+            );
+            core.setOutput("authorized", "true");
+
   compile:
     name: Build Faiss DAS (${{ matrix.dtk }})
+    needs: authorize-pr
+    if: >-
+      ${{
+        needs.authorize-pr.result == 'success' &&
+        needs.authorize-pr.outputs.authorized == 'true'
+      }}
     runs-on: hygon-build
     timeout-minutes: 180
     strategy:
@@ -27,12 +139,16 @@ jobs:
       matrix:
         include:
           - dtk: dtk2604
+            dtk_version: "2604"
             image: hcu/base/dtk:26.04-rockylinux8.6-py3.10
-            dtk_index: nightly/dtk2604/+simple/
             aicc_major: 1.0.0
           - dtk: dtk2610
+            dtk_version: "2610"
             image: hcu/base/dtk:26.10-rockylinux8.6-py3.12
-            dtk_index: nightly/dtk2610/+simple/
+            aicc_major: 2.0.0
+          - dtk: dtk2704
+            dtk_version: "2704"
+            image: hcu/base/dtk:27.04-rockylinux8.6-py3.12
             aicc_major: 2.0.0
     env:
       ARTIFACT_DIR: /ci_public/faiss-das/runs/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.dtk }}
@@ -96,7 +212,7 @@ jobs:
         run: |
           set -euo pipefail
           wget "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh"
-          if [[ "${DTK_VARIANT}" == "dtk2610" ]]; then
+          if [[ "${DTK_VARIANT}" == "dtk2610" || "${DTK_VARIANT}" == "dtk2704-torch213" ]]; then
             bash hcu_llvm_installer.sh --major "${AICC_MAJOR}" --dtk-dir /opt/dtk
           else
             bash hcu_llvm_installer.sh --major "${AICC_MAJOR}"
@@ -109,6 +225,8 @@ jobs:
           set +u
           source /opt/dtk/env.sh
           set -u
+          : "${AMDGPU_TARGETS:?ERROR: DTK env.sh did not set AMDGPU_TARGETS}"
+          echo "Building for GPU targets: ${AMDGPU_TARGETS}"
           bash faiss/gpu/hipify.sh
           clang_runtime_dir="$(find /opt/dtk/dcc/lib/clang -type d -path '*/lib/linux' -print -quit 2>/dev/null || true)"
           [[ -n "${clang_runtime_dir}" ]] || { echo "Clang runtime directory was not found" >&2; exit 1; }
@@ -145,7 +263,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/build/install" \
             -Damd_comgr_DIR="${amd_comgr_dir}" \
-            -DMKL_LIBRARIES="${mkl_library}"
+            -DMKL_LIBRARIES="${mkl_library}" \
+            -DCMAKE_HIP_ARCHITECTURES="${AMDGPU_TARGETS}"
           cmake --build build --parallel "${MAX_JOBS}"
           cmake --install build
           cd build/faiss/python
@@ -161,15 +280,16 @@ jobs:
       - name: Apply DAS local version to wheel
         shell: bash
         env:
+          DTK_VERSION: ${{ matrix.dtk_version }}
           GIT_COMMIT: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          dtk_version="$(tr -d '.[:space:]' < /opt/dtk/.info/rocm_version)"
-          CIUpload REPAIR \
-            --dtk_version "${dtk_version}" \
-            --git_commit "${GIT_COMMIT}" \
-            --outputdir output \
-            -f build/dist-manylinux/*.whl
+          repair_args=(
+            --dtk_version "${DTK_VERSION}"
+            --git_commit "${GIT_COMMIT:0:6}"
+            --outputdir output
+          )
+          CIUpload REPAIR "${repair_args[@]}" -f build/dist-manylinux/*.whl
 
       - name: Save build outputs for tests
         shell: bash
@@ -188,7 +308,7 @@ jobs:
   test:
     name: Test Faiss DAS (${{ matrix.dtk }}, 1 card)
     needs: compile
-    if: ${{ always() && needs.compile.result != 'cancelled' }}
+    if: ${{ needs.compile.result == 'success' }}
     runs-on: hygon-bw1100-1card
     timeout-minutes: 180
     strategy:
@@ -196,11 +316,14 @@ jobs:
       matrix:
         include:
           - dtk: dtk2604
+            dtk_version: "2604"
             image: hcu/base/dtk:26.04-rockylinux8.6-py3.10
-            dtk_index: nightly/dtk2604/+simple/
           - dtk: dtk2610
+            dtk_version: "2610"
             image: hcu/base/dtk:26.10-rockylinux8.6-py3.12
-            dtk_index: nightly/dtk2610/+simple/
+          - dtk: dtk2704
+            dtk_version: "2704"
+            image: hcu/base/dtk:27.04-rockylinux8.6-py3.12
     env:
       ARTIFACT_DIR: /ci_public/faiss-das/runs/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.dtk }}
     defaults:
