@@ -4,133 +4,27 @@ on:
   pull_request_target:
     branches:
       - 1.9.0
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
 
 concurrency:
   group: faiss-das-pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: >-
-    ${{
-      (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-      github.event.label.name == 'ready-hcu'
-    }}
+  cancel-in-progress: true
 
 env:
   PYPI_URL: ${{ vars.PYPI_URL }}
   MAX_JOBS: "32"
 
 jobs:
-  authorize-pr:
-    name: Authorize HCU execution
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: write
-    outputs:
-      authorized: ${{ steps.authorization.outputs.authorized }}
-    steps:
-      - name: Verify ready-hcu authorization
-        id: authorization
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const label = "ready-hcu";
-            const action = context.payload.action;
-            const pullRequest = context.payload.pull_request;
-            const labels = pullRequest.labels.map(item => item.name);
-
-            core.setOutput("authorized", "false");
-
-            if (action === "synchronize" && labels.includes(label)) {
-              await github.rest.issues.removeLabel({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: pullRequest.number,
-                name: label,
-              });
-              core.setFailed(
-                `PR #${pullRequest.number} was updated to ${pullRequest.head.sha}. ` +
-                `The ${label} label was removed; a trusted maintainer must apply it again.`
-              );
-              return;
-            }
-
-            if ((action === "labeled" || action === "unlabeled") &&
-                context.payload.label?.name !== label) {
-              if (!labels.includes(label)) {
-                core.setFailed(
-                  `HCU CI is locked for ${pullRequest.head.sha}. ` +
-                  `A trusted maintainer must apply the ${label} label.`
-                );
-                return;
-              }
-              core.info(`Ignoring unrelated label: ${context.payload.label?.name}.`);
-              return;
-            }
-
-            if (action === "unlabeled") {
-              core.setFailed(
-                `HCU CI authorization was revoked for PR #${pullRequest.number}. ` +
-                `A trusted maintainer must apply the ${label} label.`
-              );
-              return;
-            }
-
-            if (action !== "labeled") {
-              if (labels.includes(label)) {
-                core.info(
-                  `PR #${pullRequest.number} remains authorized for ${pullRequest.head.sha}.`
-                );
-                core.setOutput("authorized", "true");
-                return;
-              }
-              core.setFailed(
-                `HCU CI is locked for ${pullRequest.head.sha}. ` +
-                `A trusted maintainer must apply the ${label} label.`
-              );
-              return;
-            }
-
-            const response = await github.rest.repos.getCollaboratorPermissionLevel({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              username: context.actor,
-            });
-            const permission = response.data.permission;
-            const trusted = new Set(["write", "maintain", "admin"]);
-            if (!trusted.has(permission)) {
-              try {
-                await github.rest.issues.removeLabel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: pullRequest.number,
-                  name: label,
-                });
-              } catch (error) {
-                if (error.status !== 404) {
-                  throw error;
-                }
-              }
-              core.setFailed(
-                `${context.actor} cannot authorize HCU CI (permission: ${permission}).`
-              );
-              return;
-            }
-
-            core.info(
-              `${context.actor} authorized HCU CI for ${pullRequest.head.sha}.`
-            );
-            core.setOutput("authorized", "true");
-
   compile:
     name: Build Faiss DAS (${{ matrix.dtk }})
-    needs: authorize-pr
     if: >-
       ${{
-        needs.authorize-pr.result == 'success' &&
-        needs.authorize-pr.outputs.authorized == 'true'
+        github.event.action == 'labeled' &&
+        github.event.label.name == 'ready-hcu' &&
+        contains(github.event.pull_request.labels.*.name, 'ready-hcu')
       }}
     runs-on: hygon-build
     timeout-minutes: 180
@@ -181,7 +75,6 @@ jobs:
         shell: bash
         env:
           PYPI_INDEX: ${{ env.PYPI_URL }}/open/pypi/+simple/
-          DTK_INDEX: ${{ env.PYPI_URL }}/${{ matrix.dtk_index }}
         run: |
           set -euo pipefail
           trusted_host="${PYPI_INDEX#*://}"
@@ -189,11 +82,12 @@ jobs:
           trusted_host="${trusted_host%%:*}"
           mkdir -p ~/.pip
           printf '%s\n' '[global]' "index-url = ${PYPI_INDEX}" \
-            "extra-index-url = ${DTK_INDEX}" \
             "trusted-host = ${trusted_host}" > ~/.pip/pip.conf
 
       - name: Verify DTK and install build dependencies
         shell: bash
+        env:
+          CIUPLOAD_INDEX: ${{ env.PYPI_URL }}/open/deps/+simple/
         run: |
           set -euo pipefail
           test -f /opt/dtk/env.sh
@@ -201,7 +95,12 @@ jobs:
           source /opt/dtk/env.sh
           set -u
           hipcc --version
-          pip install --no-cache-dir numpy==1.26.4 swig ninja wheel setuptools packaging ciupload
+          pip install --no-cache-dir numpy==1.26.4 swig ninja wheel setuptools packaging
+          trusted_host="${CIUPLOAD_INDEX#*://}"
+          trusted_host="${trusted_host%%/*}"
+          trusted_host="${trusted_host%%:*}"
+          pip install --no-cache-dir --index-url "${CIUPLOAD_INDEX}" \
+            --trusted-host "${trusted_host}" ciupload
 
       - name: Install AICC
         shell: bash
@@ -355,7 +254,6 @@ jobs:
         shell: bash
         env:
           PYPI_INDEX: ${{ env.PYPI_URL }}/open/pypi/+simple/
-          DTK_INDEX: ${{ env.PYPI_URL }}/${{ matrix.dtk_index }}
         run: |
           set -euo pipefail
           trusted_host="${PYPI_INDEX#*://}"
@@ -363,7 +261,6 @@ jobs:
           trusted_host="${trusted_host%%:*}"
           mkdir -p ~/.pip
           printf '%s\n' '[global]' "index-url = ${PYPI_INDEX}" \
-            "extra-index-url = ${DTK_INDEX}" \
             "trusted-host = ${trusted_host}" > ~/.pip/pip.conf
 
       - name: Restore build outputs
