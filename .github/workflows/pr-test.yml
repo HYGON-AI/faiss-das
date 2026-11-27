@@ -43,6 +43,20 @@ jobs:
 
             core.setOutput("authorized", "false");
 
+            if (action === "synchronize" && labels.includes(label)) {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pullRequest.number,
+                name: label,
+              });
+              core.setFailed(
+                `PR #${pullRequest.number} was updated to ${pullRequest.head.sha}. ` +
+                `The ${label} label was removed; a trusted maintainer must apply it again.`
+              );
+              return;
+            }
+
             if ((action === "labeled" || action === "unlabeled") &&
                 context.payload.label?.name !== label) {
               if (!labels.includes(label)) {
