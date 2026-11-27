@@ -52,7 +52,6 @@ jobs:
         shell: bash
         env:
           PYPI_INDEX: ${{ env.PYPI_URL }}/open/pypi/+simple/
-          DTK_INDEX: ${{ env.PYPI_URL }}/${{ matrix.dtk_index }}
         run: |
           set -euo pipefail
           trusted_host="${PYPI_INDEX#*://}"
@@ -62,7 +61,6 @@ jobs:
           printf '%s\n' \
             '[global]' \
             "index-url = ${PYPI_INDEX}" \
-            "extra-index-url = ${DTK_INDEX}" \
             "trusted-host = ${trusted_host}" \
             > ~/.pip/pip.conf
 
@@ -93,10 +91,17 @@ jobs:
 
       - name: Install build dependencies
         shell: bash
+        env:
+          CIUPLOAD_INDEX: ${{ env.PYPI_URL }}/open/deps/+simple/
         run: |
           set -euo pipefail
           pip install --no-cache-dir \
-            numpy==1.26.4 swig ninja wheel setuptools packaging ciupload
+            numpy==1.26.4 swig ninja wheel setuptools packaging
+          trusted_host="${CIUPLOAD_INDEX#*://}"
+          trusted_host="${trusted_host%%/*}"
+          trusted_host="${trusted_host%%:*}"
+          pip install --no-cache-dir --index-url "${CIUPLOAD_INDEX}" \
+            --trusted-host "${trusted_host}" ciupload
 
       - name: Build wheel
         shell: bash
